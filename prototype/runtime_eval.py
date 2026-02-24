@@ -2,7 +2,7 @@ from dataclasses import dataclass, field
 from typing import Dict, Any, Tuple
 import numpy as np
 
-from policies import DecisionPolicy
+from prototype.policies import DecisionPolicy
 
 
 # ============================================================

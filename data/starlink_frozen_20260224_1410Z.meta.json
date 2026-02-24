@@ -1,0 +1,8 @@
+{
+  "source": "CelesTrak",
+  "url": "https://celestrak.org/NORAD/elements/gp.php?FORMAT=tle&GROUP=starlink",
+  "group": "starlink",
+  "format": "tle",
+  "fetched_at_utc": "2026-02-24T14:10:20.556497+00:00",
+  "note": "Frozen snapshot for reproducible ATG+LEO experiments"
+}

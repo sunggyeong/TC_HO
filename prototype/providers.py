@@ -3,7 +3,7 @@ from typing import List, Dict, Any, Optional
 import math
 import numpy as np
 
-from geo_utils import (
+from prototype.geo_utils import (
     haversine_distance_m,
     slant_distance_m,
     elevation_angle_deg,

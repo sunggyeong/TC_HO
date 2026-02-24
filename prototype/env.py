@@ -3,7 +3,7 @@ from typing import Dict, Any
 
 import numpy as np
 
-from providers import TrajectoryProvider, TNATGProvider, SimpleLEOSatelliteProvider, PhaseMaskProvider
+from prototype.providers import TrajectoryProvider, TNATGProvider, SimpleLEOSatelliteProvider, PhaseMaskProvider
 
 
 @dataclass
