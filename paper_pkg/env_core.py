@@ -1,11 +1,27 @@
-# experiments_atg_leo.py
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""paper_pkg.env_core
+
+Clean core environment/execution module for the NEW paper experiments only.
+
+Includes:
+- ExperimentConfig (+ RuntimeModelConfig)
+- build_env (actual/predicted)
+- sustainable_dag_plan (with configurable allow_skip_edge)
+- execute_plan_on_env
+- summarize_runs
+
+Legacy experiment drivers (Exp1/Exp2) are intentionally excluded.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, List, Tuple, Optional
 import math
 import time
+import copy
 import numpy as np
 import pandas as pd
 
@@ -42,8 +58,8 @@ class RuntimeModelConfig:
 @dataclass
 class ExperimentConfig:
     results_dir: str = "results"
-    n_runs: int = 3
-    seeds: List[int] = field(default_factory=lambda: [0, 1, 2])
+    n_runs: int = 10
+    seeds: List[int] = field(default_factory=lambda: list(range(0, 10)))
 
     # 시나리오
     dt_sec: float = 5.0
@@ -65,6 +81,42 @@ class ExperimentConfig:
     dag_topk_per_slot: int = 12
 
     runtime: RuntimeModelConfig = field(default_factory=RuntimeModelConfig)
+
+    # ---------------------------
+    # Stress scenario presets (논문용)
+    # easy | weather_drift | deadline_crunch | paper_stress
+    # ---------------------------
+    stress_profile: str = "paper_stress"
+
+    # predicted/actual env에 각각 스트레스 주입 여부
+    stress_apply_to_predicted_env: bool = True
+    stress_apply_to_actual_env: bool = True
+
+    # (1) 예측 오차/드리프트
+    stress_pred_noise_std: float = 0.04
+    stress_pred_noise_horizon_gain: float = 0.10
+    stress_actual_drift_std: float = 0.03
+    stress_actual_noise_std: float = 0.015
+
+    # (2) ATG burst fade (악천후/난기류 느낌)
+    stress_atg_burst_prob: float = 0.06
+    stress_atg_burst_len_min: int = 2
+    stress_atg_burst_len_max: int = 6
+    stress_atg_burst_drop: float = 0.45
+
+    # (3) 후보군 급변
+    stress_candidate_drop_prob: float = 0.03
+    stress_candidate_drop_len_min: int = 1
+    stress_candidate_drop_len_max: int = 3
+    stress_candidate_drop_frac: float = 0.18
+
+    # (4) deadline crunch (Exp2 차별성 강조)
+    stress_decision_budget_ms_override: Optional[float] = 32.0
+
+    # 재현성
+    stress_seed_offset_pred: int = 10_000
+    stress_seed_offset_actual: int = 20_000
+
 
 
 # =========================================================
@@ -143,7 +195,224 @@ def build_env(cfg: ExperimentConfig, seed: int, predicted_view: bool = False):
         satellite_provider=sat_provider,
         phase_mask_provider=phase_provider,
     )
-    return env.build()
+
+    build_res = env.build()
+    return _stress_mutate_build_result(build_res, cfg, seed=seed, predicted_view=predicted_view)
+
+
+def _scenario_overrides(cfg: ExperimentConfig) -> Dict[str, Any]:
+    """Preset 문자열을 실제 스트레스 파라미터로 변환."""
+    p = {
+        "pred_noise_std": cfg.stress_pred_noise_std,
+        "pred_noise_horizon_gain": cfg.stress_pred_noise_horizon_gain,
+        "actual_drift_std": cfg.stress_actual_drift_std,
+        "actual_noise_std": cfg.stress_actual_noise_std,
+        "atg_burst_prob": cfg.stress_atg_burst_prob,
+        "atg_burst_len_min": cfg.stress_atg_burst_len_min,
+        "atg_burst_len_max": cfg.stress_atg_burst_len_max,
+        "atg_burst_drop": cfg.stress_atg_burst_drop,
+        "candidate_drop_prob": cfg.stress_candidate_drop_prob,
+        "candidate_drop_len_min": cfg.stress_candidate_drop_len_min,
+        "candidate_drop_len_max": cfg.stress_candidate_drop_len_max,
+        "candidate_drop_frac": cfg.stress_candidate_drop_frac,
+        "decision_budget_ms_override": cfg.stress_decision_budget_ms_override,
+    }
+    profile = (cfg.stress_profile or "easy").lower()
+    if profile == "easy":
+        p.update(pred_noise_std=0.0, pred_noise_horizon_gain=0.0,
+                 actual_drift_std=0.0, actual_noise_std=0.0,
+                 atg_burst_prob=0.0, candidate_drop_prob=0.0,
+                 decision_budget_ms_override=None)
+    elif profile == "weather_drift":
+        # 현실성+변별력 균형형 (all-fail 방지)
+        p.update(
+            pred_noise_std=max(p["pred_noise_std"], 0.03),
+            pred_noise_horizon_gain=max(p["pred_noise_horizon_gain"], 0.08),
+            actual_drift_std=max(p["actual_drift_std"], 0.02),
+            actual_noise_std=max(p["actual_noise_std"], 0.01),
+            atg_burst_prob=max(p["atg_burst_prob"], 0.03),
+            atg_burst_drop=max(p["atg_burst_drop"], 0.25),
+            candidate_drop_prob=max(p["candidate_drop_prob"], 0.015),
+            candidate_drop_frac=max(p["candidate_drop_frac"], 0.12),
+            # 이벤트 길이도 짧게
+            atg_burst_len_min=min(p["atg_burst_len_min"], 2),
+            atg_burst_len_max=min(p["atg_burst_len_max"], 4),
+            candidate_drop_len_min=min(p["candidate_drop_len_min"], 1),
+            candidate_drop_len_max=min(p["candidate_drop_len_max"], 2),
+            decision_budget_ms_override=None,
+        )
+    elif profile == "deadline_crunch":
+        p.update(pred_noise_std=max(p["pred_noise_std"], 0.03),
+                 pred_noise_horizon_gain=max(p["pred_noise_horizon_gain"], 0.08),
+                 actual_drift_std=max(p["actual_drift_std"], 0.02),
+                 actual_noise_std=max(p["actual_noise_std"], 0.015),
+                 atg_burst_prob=max(p["atg_burst_prob"], 0.03),
+                 candidate_drop_prob=max(p["candidate_drop_prob"], 0.01),
+                 decision_budget_ms_override=(p["decision_budget_ms_override"] if p["decision_budget_ms_override"] is not None else 32.0))
+    elif profile == "paper_stress":
+        # 논문용 추천: 현실성 + 성능 차이 둘 다 드러나는 조합
+        p.update(pred_noise_std=max(p["pred_noise_std"], 0.06),
+                 pred_noise_horizon_gain=max(p["pred_noise_horizon_gain"], 0.16),
+                 actual_drift_std=max(p["actual_drift_std"], 0.05),
+                 actual_noise_std=max(p["actual_noise_std"], 0.025),
+                 atg_burst_prob=max(p["atg_burst_prob"], 0.10),
+                 atg_burst_drop=max(p["atg_burst_drop"], 0.55),
+                 candidate_drop_prob=max(p["candidate_drop_prob"], 0.04),
+                 candidate_drop_frac=max(p["candidate_drop_frac"], 0.22),
+                 decision_budget_ms_override=(p["decision_budget_ms_override"] if p["decision_budget_ms_override"] is not None else 32.0))
+    else:
+        print(f"[warn] unknown stress_profile={cfg.stress_profile!r}; using manual stress values.")
+    return p
+
+
+def _safe_np(a):
+    try:
+        return None if a is None else np.array(a, dtype=float, copy=True)
+    except Exception:
+        return None
+
+
+def _clamp01(a):
+    if a is not None:
+        np.clip(a, 0.0, 1.0, out=a)
+    return a
+
+
+def _infer_tn_indices(build_res, n_cols: int) -> np.ndarray:
+    meta = getattr(build_res, "meta_all", None)
+    if isinstance(meta, pd.DataFrame) and len(meta) == n_cols:
+        try:
+            joined = meta.astype(str).agg(" | ".join, axis=1).str.lower()
+            mask = joined.str.contains(r"\btn\b|atg|terrestrial|ground")
+            idx = np.where(mask.to_numpy())[0]
+            if len(idx) > 0:
+                return idx.astype(int)
+        except Exception:
+            pass
+    return np.arange(n_cols, dtype=int)
+
+
+def _apply_horizon_noise(A: np.ndarray, rng: np.random.RandomState, base_std: float, gain: float):
+    if A is None or (base_std <= 0 and gain <= 0):
+        return
+    T, N = A.shape
+    tnorm = np.linspace(0.0, 1.0, T, dtype=float)[:, None]
+    std = base_std + gain * tnorm
+    A += rng.normal(0.0, std, size=(T, N))
+
+
+def _apply_lowfreq_drift(A: np.ndarray, rng: np.random.RandomState, drift_std: float):
+    if A is None or drift_std <= 0:
+        return
+    T, N = A.shape
+    t = np.arange(T, dtype=float)[:, None] / max(T, 1)
+    freq = rng.uniform(0.5, 1.6, size=(1, N))
+    phase = rng.uniform(0.0, 2.0*np.pi, size=(1, N))
+    amp = rng.uniform(0.5*drift_std, 1.5*drift_std, size=(1, N))
+    A += amp * np.sin(2.0*np.pi*freq*t + phase)
+
+
+def _apply_candidate_dropouts(A: np.ndarray, rng: np.random.RandomState, p_start: float, len_min: int, len_max: int, drop_frac: float):
+    if A is None or p_start <= 0 or drop_frac <= 0:
+        return
+    T, N = A.shape
+    if N <= 0:
+        return
+    k = max(1, int(round(N * drop_frac)))
+    l0 = max(1, int(len_min))
+    l1 = max(l0, int(len_max))
+    for t0 in range(T):
+        if rng.rand() < p_start:
+            L = int(rng.randint(l0, l1 + 1))
+            t1 = min(T, t0 + L)
+            cols = rng.choice(N, size=min(k, N), replace=False)
+            A[t0:t1, cols] *= rng.uniform(0.05, 0.25)
+
+
+def _apply_atg_bursts(A: np.ndarray, build_res, rng: np.random.RandomState, p_start: float, len_min: int, len_max: int, drop: float):
+    if A is None or p_start <= 0 or drop <= 0:
+        return
+    T, N = A.shape
+    tn_idx = _infer_tn_indices(build_res, N)
+    if len(tn_idx) == 0:
+        return
+    l0 = max(1, int(len_min))
+    l1 = max(l0, int(len_max))
+    num_cols = max(1, int(round(0.25 * len(tn_idx))))
+    for t0 in range(T):
+        if rng.rand() < p_start:
+            L = int(rng.randint(l0, l1 + 1))
+            t1 = min(T, t0 + L)
+            cols = rng.choice(tn_idx, size=min(num_cols, len(tn_idx)), replace=False)
+            A[t0:t1, cols] -= drop
+
+
+def _stress_mutate_build_result(build_res, cfg: ExperimentConfig, seed: int, predicted_view: bool):
+    profile = (cfg.stress_profile or "easy").lower()
+    if profile == "easy":
+        return build_res
+    if predicted_view and not cfg.stress_apply_to_predicted_env:
+        return build_res
+    if (not predicted_view) and not cfg.stress_apply_to_actual_env:
+        return build_res
+
+    p = _scenario_overrides(cfg)
+    seed_offset = cfg.stress_seed_offset_pred if predicted_view else cfg.stress_seed_offset_actual
+    rng = np.random.RandomState(int(seed) + int(seed_offset))
+
+    A_final = _safe_np(getattr(build_res, "A_final", None))
+    if A_final is None or A_final.ndim != 2:
+        return build_res
+
+    if predicted_view:
+        _apply_horizon_noise(A_final, rng, float(p["pred_noise_std"]), float(p["pred_noise_horizon_gain"]))
+    else:
+        _apply_lowfreq_drift(A_final, rng, float(p["actual_drift_std"]))
+        if float(p["actual_noise_std"]) > 0:
+            A_final += rng.normal(0.0, float(p["actual_noise_std"]), size=A_final.shape)
+
+    _apply_candidate_dropouts(
+        A_final, rng,
+        p_start=float(p["candidate_drop_prob"]),
+        len_min=int(p["candidate_drop_len_min"]),
+        len_max=int(p["candidate_drop_len_max"]),
+        drop_frac=float(p["candidate_drop_frac"]),
+    )
+    _apply_atg_bursts(
+        A_final, build_res, rng,
+        p_start=float(p["atg_burst_prob"]),
+        len_min=int(p["atg_burst_len_min"]),
+        len_max=int(p["atg_burst_len_max"]),
+        drop=float(p["atg_burst_drop"]),
+    )
+
+    # 보조 행렬들도 shape 맞으면 약하게 교란 (A_final과 완전 불일치 방지 목적)
+    for attr in ["A_tn", "A_leo", "utility"]:
+        aux = _safe_np(getattr(build_res, attr, None))
+        if aux is not None and aux.shape == A_final.shape:
+            if attr == "utility":
+                aux += rng.normal(0.0, 0.25 * float(p["actual_noise_std"] if not predicted_view else p["pred_noise_std"]), size=aux.shape)
+            else:
+                aux += rng.normal(0.0, 0.5 * float(p["actual_noise_std"] if not predicted_view else p["pred_noise_std"]), size=aux.shape)
+            setattr(build_res, attr, _clamp01(aux))
+
+    A_final = _clamp01(A_final)
+    # 연속값으로 주입된 경우를 대비해 이진 가용성으로 복구
+    A_final = (A_final >= 0.5).astype(np.int8)
+
+    setattr(build_res, "A_final", A_final)
+    return build_res
+
+
+def _apply_deadline_stress(cfg: ExperimentConfig):
+    p = _scenario_overrides(cfg)
+    override = p.get("decision_budget_ms_override", None)
+    if override is None:
+        return
+    try:
+        cfg.runtime.decision_budget_ms = float(override)
+    except Exception:
+        pass
 
 
 # =========================================================
@@ -158,7 +427,7 @@ def sustainable_dag_plan(build_res, cfg: ExperimentConfig) -> np.ndarray:
             outage_penalty=cfg.dag_outage_penalty,
             latency_penalty_scale=cfg.dag_latency_penalty_scale,
             topk_per_slot=cfg.dag_topk_per_slot,
-            allow_skip_edge=False,
+            allow_skip_edge=getattr(cfg, 'dag_allow_skip_edge', True),
         )
     )
     out = planner.plan(
@@ -395,6 +664,7 @@ def execute_plan_on_env(
         "Method": method_name,
         "Mode": mode,
         "SamplingSteps": int(sampling_steps),
+        "Scenario": str(getattr(cfg, "stress_profile", "easy")),
 
         "Availability": availability,
         "MeanInterruption_ms": mean_int,
@@ -426,12 +696,24 @@ def execute_plan_on_env(
 # =========================================================
 
 def summarize_runs(df_runs: pd.DataFrame) -> pd.DataFrame:
+    # 기본 그룹 키
     group_cols = ["Method", "Mode", "SamplingSteps"]
-    metric_cols = [c for c in df_runs.columns if c not in group_cols + ["seed"]]
 
-    agg_map = {}
-    for c in metric_cols:
-        agg_map[c] = ["mean", "std"]
+    # 스트레스/시나리오 구분 컬럼이 있으면 그룹 키에 포함 (혼합 집계를 방지)
+    for c in ["StressProfile", "stress_profile", "Scenario", "scenario", "profile", "stress"]:
+        if c in df_runs.columns and c not in group_cols:
+            group_cols.append(c)
+            break
+
+    # 숫자형 metric만 집계 대상으로 선택 (문자열 컬럼 mean 집계 에러 방지)
+    metric_cols = []
+    for c in df_runs.columns:
+        if c in group_cols or c == "seed":
+            continue
+        if pd.api.types.is_numeric_dtype(df_runs[c]):
+            metric_cols.append(c)
+
+    agg_map = {c: ["mean", "std"] for c in metric_cols}
     agg_map["seed"] = ["count"]
 
     g = df_runs.groupby(group_cols, as_index=False).agg(agg_map)
@@ -440,12 +722,13 @@ def summarize_runs(df_runs: pd.DataFrame) -> pd.DataFrame:
     new_cols = []
     for col in g.columns:
         if isinstance(col, tuple):
-            if col[0] in group_cols and (col[1] == "" or col[1] is None):
-                new_cols.append(col[0])
-            elif col[0] == "seed" and col[1] == "count":
+            base, stat = col[0], col[1]
+            if base in group_cols and (stat == "" or stat is None):
+                new_cols.append(base)
+            elif base == "seed" and stat == "count":
                 new_cols.append("n_runs")
             else:
-                new_cols.append(f"{col[0]}_{col[1]}")
+                new_cols.append(f"{base}_{stat}")
         else:
             new_cols.append(col)
     g.columns = new_cols
@@ -464,193 +747,7 @@ def summarize_runs(df_runs: pd.DataFrame) -> pd.DataFrame:
 
     return g
 
-
 # =========================================================
 # Experiments
 # =========================================================
 
-def run_experiment_1_core_compare(cfg: ExperimentConfig) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Exp1:
-      - Sustainable_DAG_NetworkX (ATG+LEO)
-      - Predicted_Diffusion (steps=12)
-      - Predicted_Consistency (steps=2)
-    """
-    methods = [
-        {"Method": "Predicted_Consistency", "Mode": "consistency", "SamplingSteps": 2},
-        {"Method": "Predicted_Diffusion",   "Mode": "diffusion",   "SamplingSteps": 12},
-        {"Method": "Sustainable_DAG_NetworkX", "Mode": "sustainable_dag", "SamplingSteps": 0},
-    ]
-
-    all_rows = []
-    timeline_saved = False
-
-    print("\n=== Experiment 1: Core Comparison (ATG + LEO, Skyfield+Frozen TLE) ===")
-    for seed in cfg.seeds[:cfg.n_runs]:
-        np.random.seed(seed)
-
-        # 실행 기준 env (oracle-like actual environment)
-        actual_env = build_env(cfg, seed=seed, predicted_view=False)
-
-        # predicted env (예측 오차 반영)
-        pred_env = build_env(cfg, seed=seed, predicted_view=True)
-
-        # predicted 계열은 predicted env 기준 동일 계획 공유
-        predicted_planned_idx = predicted_plan_from_predicted_env(pred_env, cfg)
-
-        for m in methods:
-            name = m["Method"]
-            mode = m["Mode"]
-            steps = int(m["SamplingSteps"])
-
-            if mode == "sustainable_dag":
-                planned_idx = sustainable_dag_plan(actual_env, cfg)
-                exec_env = actual_env
-            else:
-                planned_idx = predicted_planned_idx
-                exec_env = actual_env  # 계획은 predicted, 실행평가 는 실제 env
-
-            tl, metrics = execute_plan_on_env(
-                build_res=exec_env,
-                planned_idx=planned_idx,
-                method_name=name,
-                mode=mode,
-                sampling_steps=steps,
-                cfg=cfg,
-            )
-            metrics["seed"] = seed
-            all_rows.append(metrics)
-
-            # seed0 timeline 저장 (predicted diff/cons + sustainable)
-            if seed == 0:
-                tag = name.lower().replace(" ", "_")
-                outp = Path(cfg.results_dir) / f"timeline_{tag}_seed0.csv"
-                tl.to_csv(outp, index=False)
-
-                # coverage matrix도 seed0 한 번 저장
-                if not timeline_saved:
-                    np.save(Path(cfg.results_dir) / "A_atg_seed0.npy", actual_env.A_tn)
-                    np.save(Path(cfg.results_dir) / "A_leo_seed0.npy", actual_env.A_leo)
-                    np.save(Path(cfg.results_dir) / "M_phase_seed0.npy", actual_env.M_phase)
-                    np.save(Path(cfg.results_dir) / "A_final_seed0.npy", actual_env.A_final)
-                    
-                    meta_df = pd.DataFrame(actual_env.meta_all)
-                    #  insert 시 발생할 수 있는 ValueError를 방지하기 위해 'global_idx'가 이미 있다면 안전하게 제거
-                    if "global_idx" in meta_df.columns:
-                        meta_df = meta_df.drop(columns=["global_idx"])
-                    
-                    # 'global_idx'를 맨 앞(인덱스 0)에 깔끔하게 삽입
-                    meta_df.insert(0, "global_idx", np.arange(len(meta_df), dtype=int))
-                    meta_df.to_csv(Path(cfg.results_dir) / "candidate_meta_seed0.csv", index=False)
-                    timeline_saved = True
-
-            print(
-                f"{name:>26s} | mode={mode:14s} | steps={steps:2d} | "
-                f"Avail={metrics['Availability']:.4f} | QoE={metrics['EffectiveQoE']:.4f} | "
-                f"DLMiss={metrics['DeadlineMissRatio']:.4f} | Lat(ms)={metrics['MeanLatency_ms']:.2f} | "
-                f"Int(ms)={metrics['MeanInterruption_ms']:.2f}"
-            )
-
-    df_runs = pd.DataFrame(all_rows)
-    df_summary = summarize_runs(df_runs)
-    return df_runs, df_summary
-
-
-def run_experiment_2_step_sweep(cfg: ExperimentConfig) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Exp2:
-      consistency step sweep vs diffusion step sweep
-    """
-    methods = []
-    for s in [1, 2, 4, 8]:
-        methods.append({"Method": "Predicted_Consistency", "Mode": "consistency", "SamplingSteps": s})
-    for s in [4, 8, 12, 16]:
-        methods.append({"Method": "Predicted_Diffusion", "Mode": "diffusion", "SamplingSteps": s})
-
-    all_rows = []
-
-    print("\n=== Experiment 2: Step Budget Sweep (ATG + LEO, Skyfield+Frozen TLE) ===")
-    for seed in cfg.seeds[:cfg.n_runs]:
-        np.random.seed(seed)
-
-        actual_env = build_env(cfg, seed=seed, predicted_view=False)
-        pred_env = build_env(cfg, seed=seed, predicted_view=True)
-
-        predicted_planned_idx = predicted_plan_from_predicted_env(pred_env, cfg)
-
-        for m in methods:
-            name = m["Method"]
-            mode = m["Mode"]
-            steps = int(m["SamplingSteps"])
-
-            tl, metrics = execute_plan_on_env(
-                build_res=actual_env,
-                planned_idx=predicted_planned_idx,
-                method_name=name,
-                mode=mode,
-                sampling_steps=steps,
-                cfg=cfg,
-            )
-            metrics["seed"] = seed
-            all_rows.append(metrics)
-
-            print(
-                f"{name:>26s} | mode={mode:12s} | steps={steps:2d} | "
-                f"Avail={metrics['Availability']:.4f} | QoE={metrics['EffectiveQoE']:.4f} | "
-                f"DLMiss={metrics['DeadlineMissRatio']:.4f} | Lat(ms)={metrics['MeanLatency_ms']:.2f} | "
-                f"Int(ms)={metrics['MeanInterruption_ms']:.2f}"
-            )
-
-    df_runs = pd.DataFrame(all_rows)
-    df_summary = summarize_runs(df_runs)
-    return df_runs, df_summary
-
-
-# =========================================================
-# Main
-# =========================================================
-
-def main():
-    cfg = ExperimentConfig()
-
-    results_dir = Path(cfg.results_dir)
-    results_dir.mkdir(parents=True, exist_ok=True)
-
-    # TLE 파일 체크
-    if not Path(cfg.tle_path).exists():
-        raise FileNotFoundError(
-            f"Frozen TLE 파일이 없습니다: {cfg.tle_path}\n"
-            "예) data/starlink_frozen_20260224_1410Z.tle 로 저장 후 실행하세요."
-        )
-
-    t0 = time.time()
-
-    exp1_runs, exp1_summary = run_experiment_1_core_compare(cfg)
-    exp2_runs, exp2_summary = run_experiment_2_step_sweep(cfg)
-
-    # 저장 (네 기존 파일명 최대한 유지)
-    exp1_runs.to_csv(results_dir / "exp1_core_compare_runs.csv", index=False)
-    exp1_summary.to_csv(results_dir / "exp1_core_compare_summary.csv", index=False)
-
-    exp2_runs.to_csv(results_dir / "exp2_step_sweep_runs.csv", index=False)
-    exp2_summary.to_csv(results_dir / "exp2_step_sweep_summary.csv", index=False)
-
-    dt = time.time() - t0
-    print("\nSaved files:")
-    print(" - results/exp1_core_compare_runs.csv")
-    print(" - results/exp1_core_compare_summary.csv")
-    print(" - results/exp2_step_sweep_runs.csv")
-    print(" - results/exp2_step_sweep_summary.csv")
-    print(" - results/timeline_predicted_consistency_seed0.csv")
-    print(" - results/timeline_predicted_diffusion_seed0.csv")
-    print(" - results/timeline_sustainable_dag_networkx_seed0.csv")
-    print(" - results/A_atg_seed0.npy")
-    print(" - results/A_leo_seed0.npy")
-    print(" - results/M_phase_seed0.npy")
-    print(" - results/A_final_seed0.npy")
-    print(" - results/candidate_meta_seed0.csv")
-    print(f"\nTotal elapsed: {dt:.2f} sec")
-
-
-if __name__ == "__main__":
-    main()
