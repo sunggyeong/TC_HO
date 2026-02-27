@@ -20,14 +20,19 @@ def main():
     ap.add_argument("--scenario", choices=["normal","paper_stress"], default="paper_stress")
     ap.add_argument("--preset", choices=["stable","balanced","aggressive"], default="balanced")
     ap.add_argument("--results_dir", default="results_paper")
-    ap.add_argument("--epochs", type=int, default=3)
+    ap.add_argument("--epochs", type=int, default=30, help="paper: 30")
     ap.add_argument("--max_sats", type=int, default=None, help="override cfg.max_sats")
-    ap.add_argument("--train_seeds", nargs="+", type=int, default=[0])
-    ap.add_argument("--val_seeds", nargs="+", type=int, default=[1])
+    ap.add_argument("--train_seeds", nargs="+", type=int, default=None,
+                    help="paper: 0..14 (15). If not set, [0]")
+    ap.add_argument("--val_seeds", nargs="+", type=int, default=None,
+                    help="paper: 15..19 (5). If not set, [1]")
+    ap.add_argument("--test_seeds", nargs="+", type=int, default=None,
+                    help="paper eval: 20..29 (10). Stored in manifest only; use eval --seeds for runs")
     ap.add_argument("--L", type=int, default=20)
     ap.add_argument("--H", type=int, default=30)
     ap.add_argument("--stride", type=int, default=5)
     ap.add_argument("--lr", type=float, default=1e-3)
+    ap.add_argument("--reward_learnable", action="store_true", help="learn reward penalty weights during training")
     args = ap.parse_args()
 
     preset = PRESETS[args.preset]
@@ -43,14 +48,17 @@ def main():
     cfg_te.results_dir = str(outdir)
     cfg_te.weight_path = str(outdir / f"weights_tc_{args.scenario}.pth")
 
-    cfg_te.train_seeds = list(args.train_seeds)
-    cfg_te.val_seeds = list(args.val_seeds)
+    # 논문용 기본: 학습 15, 검증 5, 평가 10 (eval 시 --seeds 20 21 ... 29)
+    cfg_te.train_seeds = list(args.train_seeds) if args.train_seeds is not None else list(range(15))
+    cfg_te.val_seeds = list(args.val_seeds) if args.val_seeds is not None else list(range(15, 20))
+    cfg_te.test_seeds = list(args.test_seeds) if args.test_seeds is not None else list(range(20, 30))
     cfg_te.L = int(args.L); cfg_te.H = int(args.H); cfg_te.stride = int(args.stride)
     cfg_te.lr = float(args.lr); cfg_te.epochs = int(args.epochs)
 
     cfg_te.reward_w_switch = float(preset["w_switch"])
     cfg_te.reward_w_pingpong = float(preset["w_pingpong"])
     cfg_te.reward_w_jitter = float(preset["w_jitter"])
+    cfg_te.reward_learnable = getattr(args, "reward_learnable", False)
 
     cfg_te.rt_enable_guardrails = True
     cfg_te.rt_min_dwell = int(preset["rt_dwell"])
@@ -75,7 +83,7 @@ def main():
     else:
         raise TypeError("train_on_seed_pool returned unexpected type")
 
-    tc.save_weights(transformer, consistency, cfg_te.weight_path)
+    # 가중치 저장은 train_on_seed_pool 내부에서 수행 (reward_learnable 시 reward_weights 포함)
 
     manifest = {
         "scenario": args.scenario,
@@ -84,7 +92,9 @@ def main():
         "max_sats": exp_cfg.max_sats,
         "train_seeds": cfg_te.train_seeds,
         "val_seeds": cfg_te.val_seeds,
+        "test_seeds": cfg_te.test_seeds,
         "L": cfg_te.L, "H": cfg_te.H, "stride": cfg_te.stride, "lr": cfg_te.lr,
+        "reward_learnable": cfg_te.reward_learnable,
         "penalties": {"w_switch": cfg_te.reward_w_switch, "w_pingpong": cfg_te.reward_w_pingpong, "w_jitter": cfg_te.reward_w_jitter},
         "rt_guardrails": {"dwell": cfg_te.rt_min_dwell, "hysteresis": cfg_te.rt_hysteresis_ratio,
                           "pingpong_window": cfg_te.rt_pingpong_window, "pingpong_extra": cfg_te.rt_pingpong_extra_hysteresis_ratio},

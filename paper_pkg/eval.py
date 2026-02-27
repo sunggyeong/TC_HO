@@ -10,11 +10,33 @@ Includes:
   - TC (offline / realtime corrected)
 """
 from __future__ import annotations
-import argparse, time
+import argparse, os, time
 from pathlib import Path
 from typing import Any, Dict, List
 import numpy as np
 import pandas as pd
+import torch
+
+
+def _safe_write_csv(df: pd.DataFrame, path: Path) -> Path:
+    """Write CSV; if target is locked (e.g. open in Excel), write to fallback and warn."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    df.to_csv(tmp, index=False)
+    try:
+        os.replace(tmp, path)
+    except (PermissionError, OSError):
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+        fallback = path.with_stem(path.stem + "_new")
+        df.to_csv(fallback, index=False)
+        print(f"[WARN] Permission denied on {path} (e.g. open in Excel). Wrote: {fallback.resolve()}")
+        return fallback
+    return path
 
 from .env_core import ExperimentConfig, build_env, sustainable_dag_plan, execute_plan_on_env, summarize_runs
 from .scenarios import apply_scenario
@@ -27,17 +49,24 @@ def load_models(weights: str, exp_cfg: ExperimentConfig, outdir: Path):
         return None
     if not Path(weights).exists():
         raise FileNotFoundError(f"weights not found: {weights}")
-    tmp = build_env(exp_cfg, seed=0, predicted_view=False)
-    _, N = np.asarray(tmp.A_final).shape
+    device = tc.get_device()
+    ckpt = torch.load(weights, map_location=device)
+    # Use N,L,H from checkpoint so model matches saved weights (avoids size mismatch when env N differs)
+    N = ckpt.get("num_nodes")
+    if N is None:
+        N = int(ckpt["transformer_state_dict"]["embedding.weight"].shape[1])
+    L = ckpt.get("L") if ckpt.get("L") is not None else tc.TrainEvalRealtimeConfig().L
+    H = ckpt.get("H") if ckpt.get("H") is not None else tc.TrainEvalRealtimeConfig().H
     cfg_te = tc.TrainEvalRealtimeConfig()
     cfg_te.exp_cfg = exp_cfg
     cfg_te.results_dir = str(outdir)
     cfg_te.weight_path = weights
-    device = tc.get_device()
-    transformer = tc.OnlineTransformerPredictor(num_nodes=N, L=cfg_te.L, H=cfg_te.H).to(device)
-    consistency = tc.OnlineConsistencyGenerator(num_nodes=N, H=cfg_te.H).to(device)
-    tc.load_weights(transformer, consistency, weights, device=device)
+    transformer = tc.OnlineTransformerPredictor(num_nodes=N, L=L, H=H).to(device)
+    consistency = tc.OnlineConsistencyGenerator(num_nodes=N, H=H).to(device)
+    transformer.load_state_dict(ckpt["transformer_state_dict"])
+    consistency.load_state_dict(ckpt["consistency_state_dict"])
     transformer.eval(); consistency.eval()
+    # Do not override exp_cfg.max_sats; plan builders will pad env history to N when env has fewer nodes
     return cfg_te, transformer, consistency
 
 def main():
@@ -75,7 +104,7 @@ def main():
     bundle = load_models(args.weights, exp_cfg, outdir) if args.weights else None
     if bundle:
         cfg_te, transformer, consistency = bundle
-        print(f"✅ loaded weights: {args.weights}")
+        print(f"[OK] loaded weights: {args.weights}")
         # Make sure RT uses lookahead fallback by default
         cfg_te.rt_fallback_mode = "lookahead"
         cfg_te.rt_enable_pending = True
@@ -131,12 +160,13 @@ def main():
             m["seed"]=seed; m["Scenario"]=args.scenario; rows.append(m)
 
     df_runs = pd.DataFrame(rows)
-    df_summary = summarize_runs(df_runs)
+    # runs 먼저 저장 (summary 계산/저장에서 오류 나도 runs는 남도록)
+    out_runs = _safe_write_csv(df_runs, outdir / "exp_paper_runs.csv")
+    print(f"[OK] saved runs: {out_runs.resolve()} (rows={len(df_runs)})")
 
-    df_runs.to_csv(outdir/"exp_paper_runs.csv", index=False)
-    df_summary.to_csv(outdir/"exp_paper_summary.csv", index=False)
-    print(f"✅ saved runs: {outdir/'exp_paper_runs.csv'}")
-    print(f"✅ saved summary: {outdir/'exp_paper_summary.csv'}")
+    df_summary = summarize_runs(df_runs)
+    out_summary = _safe_write_csv(df_summary, outdir / "exp_paper_summary.csv")
+    print(f"[OK] saved summary: {out_summary.resolve()}")
     print(f"Elapsed: {time.time()-t0:.2f}s")
 
 if __name__ == "__main__":

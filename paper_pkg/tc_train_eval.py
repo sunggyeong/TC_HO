@@ -82,6 +82,16 @@ class TrainEvalRealtimeConfig:
     reward_guided_target_min_weight: float = 0.1
     reward_guided_target_max_weight: float = 3.0
 
+    # 설계안 B: "일찍 스위치" 유도 — i가 클수록 보상에서 추가 패널티
+    reward_time_offset_penalty: float = 0.02   # total -= penalty * i (i=0 선호)
+    reward_tie_breaker_epsilon: float = 1e-6    # 보상 차이 < eps면 같은 것으로 보고 더 작은 i 선호
+
+    # 추론: target_time_offset <= k 이면 "지금/곧 스위치"로 해석 (기본 1 = 0 또는 1 슬롯 안)
+    rt_switch_time_offset_max: int = 1
+
+    # 학습 중 보상 가중치 학습 여부 (True면 w_utility, w_outage 등이 nn.Parameter로 최적화)
+    reward_learnable: bool = False
+
     # 평가 시 consistency sampling steps
     consistency_steps_eval: int = 2
 
@@ -141,15 +151,18 @@ def update_ema_target(online_net, target_net, tau=0.05):
             target_param.data.copy_(tau * online_param.data + (1.0 - tau) * target_param.data)
 
 
-def save_weights(transformer, consistency, weight_path: str):
+def save_weights(transformer, consistency, weight_path: str, reward_weights_module=None):
     Path(weight_path).parent.mkdir(parents=True, exist_ok=True)
-    torch.save(
-        {
-            "transformer_state_dict": transformer.state_dict(),
-            "consistency_state_dict": consistency.state_dict(),
-        },
-        weight_path,
-    )
+    payload = {
+        "transformer_state_dict": transformer.state_dict(),
+        "consistency_state_dict": consistency.state_dict(),
+        "num_nodes": getattr(transformer, "num_nodes", None),
+        "L": getattr(transformer, "L", None),
+        "H": getattr(transformer, "H", None),
+    }
+    if reward_weights_module is not None:
+        payload["reward_weights_state_dict"] = reward_weights_module.state_dict()
+    torch.save(payload, weight_path)
     print(f"✅ weights saved: {weight_path}")
 
 
@@ -185,6 +198,40 @@ def collect_env_pairs(cfg: ExperimentConfig, seeds: List[int]) -> List[Dict[str,
         )
     return pairs
 
+
+
+# =========================================================
+# Learnable reward weights (optional)
+# =========================================================
+
+def _inverse_softplus(y: float) -> float:
+    """softplus(x)=y => x = log(exp(y)-1). y>0."""
+    if y <= 0:
+        return -2.0
+    return float(math.log(math.exp(y) - 1.0))
+
+
+class LearnableRewardWeights(nn.Module):
+    """보상 가중치 6개를 nn.Parameter로 두고 softplus로 양수 유지."""
+    def __init__(self, cfg_te: TrainEvalRealtimeConfig, device: torch.device):
+        super().__init__()
+        defaults = (
+            cfg_te.reward_w_utility,
+            getattr(cfg_te, "reward_w_outage", 0.7),
+            getattr(cfg_te, "reward_w_switch", 0.05),
+            getattr(cfg_te, "reward_w_robustness", 0.2),
+            getattr(cfg_te, "reward_w_jitter", 0.15),
+            getattr(cfg_te, "reward_w_pingpong", 0.2),
+        )
+        init_vals = [_inverse_softplus(float(d)) for d in defaults]
+        self.log_weights = nn.Parameter(torch.tensor(init_vals, dtype=torch.float32, device=device))
+
+    def forward(self) -> torch.Tensor:
+        return F.softplus(self.log_weights)  # (6,) w_u, w_o, w_s, w_r, w_j, w_p
+
+    def to_numpy_weights(self) -> Tuple[float, float, float, float, float, float]:
+        w = self.forward().detach().cpu().numpy()
+        return (float(w[0]), float(w[1]), float(w[2]), float(w[3]), float(w[4]), float(w[5]))
 
 
 # =========================================================
@@ -276,6 +323,46 @@ def _discounted_integrated_reward_single_aircraft(
         else:
             total += inst
 
+    # 설계안 B: i가 클수록 패널티 (일찍 스위치 유도)
+    total -= float(getattr(cfg_te, "reward_time_offset_penalty", 0.0)) * i
+    return float(total)
+
+
+def _discounted_integrated_reward_with_weights(
+    future_A_true: np.ndarray,
+    future_U_true: np.ndarray,
+    target_time_offset: int,
+    target_node_idx: int,
+    current_node: int,
+    prev_node: int,
+    w_u: float, w_o: float, w_s: float, w_r: float, w_j: float, w_p: float,
+    gamma: float, jitter_thr: float, use_discounted: bool,
+    time_offset_penalty: float = 0.0,
+) -> float:
+    """보상 계산 (가중치를 외부에서 주입). 학습 가능 가중치용."""
+    H, N = future_A_true.shape
+    i = int(np.clip(target_time_offset, 0, H - 1))
+    n = int(np.clip(target_node_idx, 0, N - 1))
+    robustness = float(np.mean(future_A_true[i:, n])) if i < H else 0.0
+    total = 0.0
+    switch_happens = bool(current_node != -1 and current_node != n)
+    if switch_happens:
+        total -= w_s
+        run_len = _contiguous_available_run_len(future_A_true, i, n)
+        horizon_left = max(1, H - i)
+        hold_ratio = float(run_len) / float(horizon_left)
+        jitter_pen = max(0.0, (jitter_thr - hold_ratio) / max(1e-6, jitter_thr))
+        total -= w_j * jitter_pen
+        if prev_node != -1 and current_node != -1 and prev_node == n and current_node != n:
+            total -= w_p
+    for tau in range(i, H):
+        a = float(future_A_true[tau, n])
+        u = float(future_U_true[tau, n])
+        inst = (w_u * u * a) - (w_o * (1.0 - a))
+        if tau == i:
+            inst += w_r * robustness
+        total += (gamma ** (tau - i)) * inst if use_discounted else inst
+    total -= time_offset_penalty * i
     return float(total)
 
 
@@ -309,7 +396,8 @@ def _find_best_reward_guided_target(
                 current_node=current_node,
                 cfg_te=cfg_te,
             )
-            if r > best_r:
+            eps = float(getattr(cfg_te, "reward_tie_breaker_epsilon", 1e-6))
+            if r > best_r or (abs(r - best_r) < eps and i < best_i):
                 best_r = float(r)
                 best_i, best_n = int(i), int(n)
 
@@ -317,6 +405,86 @@ def _find_best_reward_guided_target(
         return 0, 0, float(cfg_te.reward_invalid_penalty)
 
     return best_i, best_n, float(best_r)
+
+
+def _find_best_reward_guided_target_with_weights(
+    future_A_true: np.ndarray,
+    future_U_true: np.ndarray,
+    current_node: int,
+    prev_node: int,
+    w_u: float, w_o: float, w_s: float, w_r: float, w_j: float, w_p: float,
+    gamma: float, jitter_thr: float, use_discounted: bool,
+    invalid_penalty: float,
+    time_offset_penalty: float = 0.0,
+    tie_breaker_epsilon: float = 1e-6,
+) -> Tuple[int, int, float]:
+    """보상 가중치를 외부에서 주입하여 best (i, n) 및 보상값 반환. 학습 가능 가중치용."""
+    H, N = future_A_true.shape
+    best_i, best_n = 0, 0
+    best_r = -1e18
+    any_valid = False
+    for i in range(H):
+        valid_nodes = np.where(future_A_true[i] == 1)[0]
+        if len(valid_nodes) == 0:
+            continue
+        any_valid = True
+        for n in valid_nodes:
+            r = _discounted_integrated_reward_with_weights(
+                future_A_true, future_U_true, i, int(n), current_node, prev_node,
+                w_u, w_o, w_s, w_r, w_j, w_p, gamma, jitter_thr, use_discounted,
+                time_offset_penalty=time_offset_penalty,
+            )
+            if r > best_r or (abs(r - best_r) < tie_breaker_epsilon and i < best_i):
+                best_r = r
+                best_i, best_n = i, int(n)
+    if not any_valid:
+        return 0, 0, invalid_penalty
+    return best_i, best_n, float(best_r)
+
+
+def _reward_coefficients_for_action(
+    future_A_true: np.ndarray,
+    future_U_true: np.ndarray,
+    best_i: int,
+    best_n: int,
+    current_node: int,
+    prev_node: int,
+    gamma: float,
+    jitter_thr: float,
+    use_discounted: bool,
+) -> Tuple[float, float, float, float, float, float]:
+    """
+    R = c_u*w_u + c_o*w_o + c_s*w_s + c_r*w_r + c_j*w_j + c_p*w_p 인 계수 (c_u,...,c_p) 반환.
+    학습 가능 가중치에 대한 gradient를 위해 사용.
+    """
+    H, N = future_A_true.shape
+    i = int(np.clip(best_i, 0, H - 1))
+    n = int(np.clip(best_n, 0, N - 1))
+    robustness = float(np.mean(future_A_true[i:, n])) if i < H else 0.0
+    switch_happens = bool(current_node != -1 and current_node != n)
+    # utility 계수: sum_tau gamma^(tau-i) * u*a
+    c_u = 0.0
+    c_o = 0.0
+    for tau in range(i, H):
+        a = float(future_A_true[tau, n])
+        u = float(future_U_true[tau, n])
+        fac = (gamma ** (tau - i)) if use_discounted else 1.0
+        c_u += fac * (u * a)
+        c_o -= fac * (1.0 - a)
+    c_r = robustness  # w_r * robustness added once at tau==i
+    c_s = -1.0 if switch_happens else 0.0
+    if switch_happens:
+        run_len = _contiguous_available_run_len(future_A_true, i, n)
+        horizon_left = max(1, H - i)
+        hold_ratio = float(run_len) / float(horizon_left)
+        jitter_pen = max(0.0, (jitter_thr - hold_ratio) / max(1e-6, jitter_thr))
+        c_j = -jitter_pen
+        pingpong = prev_node != -1 and current_node != -1 and prev_node == n and current_node != n
+        c_p = -1.0 if pingpong else 0.0
+    else:
+        c_j = 0.0
+        c_p = 0.0
+    return (c_u, c_o, c_s, c_r, c_j, c_p)
 
 
 def _reward_to_supervision_weight(reward_val: float, cfg_te: TrainEvalRealtimeConfig) -> float:
@@ -352,10 +520,21 @@ def train_on_seed_pool(
     for p in target_consistency.parameters():
         p.requires_grad = False
 
-    optimizer = optim.Adam(
-        list(transformer.parameters()) + list(online_consistency.parameters()),
-        lr=cfg_te.lr,
-    )
+    reward_weights_module = None
+    if getattr(cfg_te, "reward_learnable", False):
+        reward_weights_module = LearnableRewardWeights(cfg_te, device)
+        optimizer = optim.Adam(
+            list(transformer.parameters())
+            + list(online_consistency.parameters())
+            + list(reward_weights_module.parameters()),
+            lr=cfg_te.lr,
+        )
+        print("[train] reward weights are learnable (optimized with policy)")
+    else:
+        optimizer = optim.Adam(
+            list(transformer.parameters()) + list(online_consistency.parameters()),
+            lr=cfg_te.lr,
+        )
     bce_loss_fn = nn.BCELoss()
 
     history_rows = []
@@ -409,7 +588,6 @@ def train_on_seed_pool(
                 y_curr = online_consistency(y_noisy_t1, condition, step_1)
 
                 # 3) Reward-guided target (mini integrated reward, single-aircraft)
-                # 현재/직전 노드 근사: t-1, t-2 슬롯에서 actual utility가 최대인 가용 노드
                 if t - 1 >= 0:
                     current_node_approx = _best_available_node(A_target[t - 1], U_target[t - 1])
                 else:
@@ -419,16 +597,50 @@ def train_on_seed_pool(
                 else:
                     prev_node_approx = -1
 
-                best_i, best_n, reward_val = _find_best_reward_guided_target(
-                    future_A_true=future_A_true,
-                    future_U_true=U_target[t : t + H, :],
-                    current_node=current_node_approx,
-                    cfg_te=cfg_te,
-                    prev_node=prev_node_approx,
-                )
+                gamma = float(cfg_te.reward_gamma)
+                jitter_thr = float(getattr(cfg_te, "reward_jitter_min_hold_ratio", 0.35))
+                use_discounted = bool(getattr(cfg_te, "reward_use_discounted_return", True))
+                invalid_penalty = float(cfg_te.reward_invalid_penalty)
+
+                time_offset_penalty = float(getattr(cfg_te, "reward_time_offset_penalty", 0.0))
+                tie_breaker_eps = float(getattr(cfg_te, "reward_tie_breaker_epsilon", 1e-6))
+
+                if reward_weights_module is not None:
+                    w_u, w_o, w_s, w_r, w_j, w_p = reward_weights_module.to_numpy_weights()
+                    best_i, best_n, reward_val = _find_best_reward_guided_target_with_weights(
+                        future_A_true, U_target[t : t + H, :],
+                        current_node_approx, prev_node_approx,
+                        w_u, w_o, w_s, w_r, w_j, w_p,
+                        gamma, jitter_thr, use_discounted, invalid_penalty,
+                        time_offset_penalty=time_offset_penalty,
+                        tie_breaker_epsilon=tie_breaker_eps,
+                    )
+                    coefs = _reward_coefficients_for_action(
+                        future_A_true, U_target[t : t + H, :],
+                        best_i, best_n, current_node_approx, prev_node_approx,
+                        gamma, jitter_thr, use_discounted,
+                    )
+                    coef_tensor = torch.tensor(coefs, dtype=torch.float32, device=device)
+                    reward_torch = (coef_tensor * reward_weights_module()).sum() - (time_offset_penalty * best_i)
+                    rl_weight_torch = 1.0 + cfg_te.reward_guided_target_scale * torch.tanh(reward_torch / 2.0)
+                    rl_weight_torch = torch.clamp(
+                        rl_weight_torch,
+                        cfg_te.reward_guided_target_min_weight,
+                        cfg_te.reward_guided_target_max_weight,
+                    )
+                    reward_val = float(reward_torch.detach().item())
+                else:
+                    best_i, best_n, reward_val = _find_best_reward_guided_target(
+                        future_A_true=future_A_true,
+                        future_U_true=U_target[t : t + H, :],
+                        current_node=current_node_approx,
+                        cfg_te=cfg_te,
+                        prev_node=prev_node_approx,
+                    )
+                    rl_weight_torch = _reward_to_supervision_weight(reward_val, cfg_te)
+
                 epoch_reward += reward_val
 
-                # reward-guided normalized target y* = [time_ratio, node_ratio]
                 y_star = torch.tensor(
                     [[
                         0.0 if H <= 1 else (best_i / float(H - 1)),
@@ -437,8 +649,7 @@ def train_on_seed_pool(
                     dtype=torch.float32,
                     device=device,
                 )
-                rl_weight = _reward_to_supervision_weight(reward_val, cfg_te)
-                loss_rl = rl_weight * F.mse_loss(y_curr, y_star)
+                loss_rl = rl_weight_torch * F.mse_loss(y_curr, y_star)
 
                 # 4) Consistency self-consistency loss (EMA target)
                 with torch.no_grad():
@@ -476,7 +687,11 @@ def train_on_seed_pool(
     transformer.eval()
     online_consistency.eval()
 
-    save_weights(transformer, online_consistency, cfg_te.weight_path)
+    if reward_weights_module is not None:
+        w = reward_weights_module.to_numpy_weights()
+        print(f"[train] learned reward weights: w_utility={w[0]:.4f} w_outage={w[1]:.4f} w_switch={w[2]:.4f} w_robust={w[3]:.4f} w_jitter={w[4]:.4f} w_pingpong={w[5]:.4f}")
+
+    save_weights(transformer, online_consistency, cfg_te.weight_path, reward_weights_module)
 
     hist_df = pd.DataFrame(history_rows)
     hist_df.to_csv(Path(cfg_te.results_dir) / "train_history_real_env.csv", index=False)
@@ -538,7 +753,13 @@ def build_learned_offline_plan_from_pred_env(
     device = next(transformer.parameters()).device
     A_pred = np.asarray(pred_env.A_final)
     U_pred = np.asarray(pred_env.utility)
-    T, N = A_pred.shape
+    T, N_env = A_pred.shape
+    N_model = getattr(transformer, "num_nodes", N_env)
+    if N_env > N_model:
+        raise ValueError(
+            f"Env has {N_env} nodes but checkpoint model expects {N_model}. "
+            "Use weights trained with at least as many nodes as your env (e.g. larger max_sats)."
+        )
 
     L, H = cfg_te.L, cfg_te.H
     planned_idx = np.full(T, -1, dtype=int)
@@ -554,19 +775,23 @@ def build_learned_offline_plan_from_pred_env(
             planned_idx[t] = current_node
             continue
 
-        history_A = A_pred[t - L : t, :]
+        history_A = A_pred[t - L : t, :]  # (L, N_env)
+        if N_env < N_model:
+            history_A = np.pad(history_A, ((0, 0), (0, N_model - N_env)), mode="constant", constant_values=0)
         target_time_offset, target_node_idx = _predict_target_from_history(
             transformer=transformer,
             consistency=consistency,
             history_A=history_A,
             H=H,
-            N=N,
+            N=N_model,
             device=device,
             consistency_steps=consistency_steps,
         )
+        target_node_idx = min(max(target_node_idx, 0), N_env - 1)
 
-        # 현재 시점 타이밍이면 switch 제안
-        if target_time_offset == 0 and A_pred[t, target_node_idx] == 1:
+        # B안: target_time_offset <= rt_switch_time_offset_max 이면 "지금/곧 스위치"로 해석
+        k = int(getattr(cfg_te, "rt_switch_time_offset_max", 1))
+        if (target_time_offset <= k) and A_pred[t, target_node_idx] == 1:
             current_node = int(target_node_idx)
 
         # predicted view에서 이미 끊긴 경우
@@ -603,6 +828,12 @@ def build_learned_realtime_corrected_plan(
     U_pred = np.asarray(pred_env.utility)
 
     T, N = A_actual.shape
+    N_model = getattr(transformer, "num_nodes", N)
+    if N > N_model:
+        raise ValueError(
+            f"Env has {N} nodes but checkpoint model expects {N_model}. "
+            "Use weights trained with at least as many nodes as your env (e.g. larger max_sats)."
+        )
     L, H = cfg_te.L, cfg_te.H
 
     planned_idx = np.full(T, -1, dtype=int)
@@ -615,6 +846,14 @@ def build_learned_realtime_corrected_plan(
 
     # 마지막 스위치 시각(슬롯 인덱스)
     last_switch_t = -10**9
+
+    # 디버그 카운터 (online TC 동작 분석용)
+    dbg_total_slots = T
+    dbg_model_proposed = 0              # 모델이 target_time_offset==0으로 switch 제안한 슬롯 수
+    dbg_model_proposed_valid = 0        # 그 중 실제 가용 슬롯인 경우
+    dbg_model_applied = 0               # 최종 플랜에서 모델 제안이 그대로 반영된 슬롯 수
+    dbg_fallback_used = 0              # actual-slot greedy fallback이 사용된 슬롯 수
+    dbg_guardrail_block = 0            # guardrail 때문에 switch가 막힌 횟수
 
     def _score(t_: int, n_: int) -> float:
         # utility * reliability (둘 다 0~대략 1 scale 기대)
@@ -644,24 +883,36 @@ def build_learned_realtime_corrected_plan(
 
         else:
             # history는 "과거 actual 관측 반영 + (미래는 여전히 predicted)"
-            history_A = A_obs_corrected[t - L : t, :]
-
+            history_A = A_obs_corrected[t - L : t, :]  # (L, N)
+            if N < N_model:
+                history_A = np.pad(history_A, ((0, 0), (0, N_model - N)), mode="constant", constant_values=0)
             target_time_offset, target_node_idx = _predict_target_from_history(
                 transformer=transformer,
                 consistency=consistency,
                 history_A=history_A,
                 H=H,
-                N=N,
+                N=N_model,
                 device=device,
                 consistency_steps=consistency_steps,
             )
+            target_node_idx = min(max(target_node_idx, 0), N - 1)
 
+            k = int(getattr(cfg_te, "rt_switch_time_offset_max", 1))
             proposed = current_node
-            if target_time_offset == 0:
+            if target_time_offset <= k:
+                dbg_model_proposed += 1
                 proposed = int(target_node_idx)
 
-            # 실시간 보정 로직 (기존)
-            proposed_valid_now = (proposed is not None and proposed >= 0 and proposed < N and A_actual[t, proposed] == 1)
+            # 실시간 보정 로직
+            proposed_valid_now = (
+                proposed is not None
+                and proposed >= 0
+                and proposed < N
+                and A_actual[t, proposed] == 1
+            )
+
+            if proposed_valid_now:
+                dbg_model_proposed_valid += 1
 
             low_rel = False
             if proposed is not None and proposed >= 0 and proposed < N:
@@ -669,10 +920,14 @@ def build_learned_realtime_corrected_plan(
 
             corrected = current_node
 
-            if proposed_valid_now and not low_rel:
+            # (변경) 모델이 현재 슬롯에서 유효한 노드를 제안하면 신뢰도와 무관하게 일단 수용
+            # (guardrail에서 추가 필터링)
+            model_based_switch = False
+            if proposed_valid_now:
                 corrected = proposed
+                model_based_switch = True
             else:
-                # proposed가 지금 안되거나 / 신뢰도 너무 낮으면 fallback
+                # proposed가 지금 안되거나 (가용 X) 하면 fallback
                 if cfg_te.rt_use_actual_current_slot_fallback:
                     avail = np.where(A_actual[t] == 1)[0]
                     if len(avail) > 0:
@@ -685,6 +940,8 @@ def build_learned_realtime_corrected_plan(
                             corrected = current_node
                         else:
                             corrected = fallback
+                            if corrected != current_node:
+                                dbg_fallback_used += 1
                     else:
                         corrected = -1 if not current_valid_now else current_node
                 else:
@@ -699,9 +956,11 @@ def build_learned_realtime_corrected_plan(
             switching = (corrected_valid_now and current_valid_now and corrected != current_node)
 
             if switching:
+                blocked = False
                 # (1) Dwell: 최근 스위치 후 일정 시간은 유지
                 if (t - last_switch_t) < int(cfg_te.rt_min_dwell):
                     corrected = current_node
+                    blocked = True
                 else:
                     # (2) Hysteresis: 충분한 이득이 있을 때만 스위치
                     s_cur = _score(t, current_node)
@@ -710,7 +969,12 @@ def build_learned_realtime_corrected_plan(
                     required_ratio = float(cfg_te.rt_hysteresis_ratio)
 
                     # (3) Ping-pong(A->B->A) 억제: t-2 노드로 되돌아가려 하면 더 큰 히스테리시스 요구
-                    is_pingpong = (corrected == prev2 and prev2 != -1 and prev1 == current_node and (t - last_switch_t) <= int(cfg_te.rt_pingpong_window))
+                    is_pingpong = (
+                        corrected == prev2
+                        and prev2 != -1
+                        and prev1 == current_node
+                        and (t - last_switch_t) <= int(cfg_te.rt_pingpong_window)
+                    )
                     if is_pingpong:
                         required_ratio += float(cfg_te.rt_pingpong_extra_hysteresis_ratio)
 
@@ -723,6 +987,10 @@ def build_learned_realtime_corrected_plan(
 
                     if not ok:
                         corrected = current_node
+                        blocked = True
+
+                if blocked:
+                    dbg_guardrail_block += 1
 
             # 현재 연결이 유효한데 corrected가 -1이면 끊김 방지로 유지(단, 실제로 유효할 때만)
             if corrected == -1 and current_valid_now:
@@ -737,6 +1005,10 @@ def build_learned_realtime_corrected_plan(
         if corrected != current_node and corrected != -1:
             last_switch_t = t
 
+        # 디버그: 최종적으로 모델 제안이 실제로 반영된 슬롯 카운트
+        if t >= L and model_based_switch and corrected == proposed and corrected != current_node:
+            dbg_model_applied += 1
+
         current_node = int(corrected) if corrected is not None else -1
         planned_idx[t] = current_node
 
@@ -749,6 +1021,18 @@ def build_learned_realtime_corrected_plan(
         reliability[fp_mask] *= cfg_te.rt_fp_extra_penalty
 
         reliability = np.clip(reliability, 0.05, 1.0)
+
+    # 디버그 로그 출력 (옵션)
+    if getattr(cfg_te, "rt_debug_log", False):
+        total_effective = max(1, dbg_total_slots - cfg_te.L)
+        print("[RT-TC debug]")
+        print(f"  total_slots                = {dbg_total_slots}")
+        print(f"  model_proposed_slots       = {dbg_model_proposed}")
+        print(f"  model_proposed_valid_slots = {dbg_model_proposed_valid}")
+        print(f"  model_applied_switches     = {dbg_model_applied}")
+        print(f"  fallback_used_switches     = {dbg_fallback_used}")
+        print(f"  guardrail_blocked_switches = {dbg_guardrail_block}")
+        print(f"  model_applied_ratio        = {dbg_model_applied / float(total_effective):.4f}")
 
     return planned_idx
 

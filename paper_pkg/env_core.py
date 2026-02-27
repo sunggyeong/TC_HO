@@ -68,17 +68,17 @@ class ExperimentConfig:
     latlon_noise_deg: float = 0.02      # predicted trajectory 오차 모사
     alt_noise_m: float = 80.0
 
-    # skyfield / tle
+    # skyfield / tle (min_elevation_deg 낮추면 가용 슬롯 비율 증가, N 유지 → 재학습 불필요)
     tle_path: str = "data/starlink_frozen_20260224_1410Z.tle"
-    min_elevation_deg: float = 10.0
+    min_elevation_deg: float = 5.0
     max_sats: int = 16                 # 테스트 시 100~300 권장
 
-    # DAG baseline params
-    dag_switch_penalty: float = 0.08
-    dag_stay_bonus: float = 0.02
-    dag_outage_penalty: float = 1.0
-    dag_latency_penalty_scale: float = 0.002
-    dag_topk_per_slot: int = 12
+    # DAG baseline params (tuned to be less harsh, more usable as baseline)
+    dag_switch_penalty: float = 0.02          # was 0.08
+    dag_stay_bonus: float = 0.03              # was 0.02
+    dag_outage_penalty: float = 0.2           # was 1.0
+    dag_latency_penalty_scale: float = 0.001  # was 0.002
+    dag_topk_per_slot: int = 64               # was 12
 
     runtime: RuntimeModelConfig = field(default_factory=RuntimeModelConfig)
 

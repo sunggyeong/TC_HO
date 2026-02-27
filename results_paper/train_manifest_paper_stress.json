@@ -1,0 +1,46 @@
+{
+  "scenario": "paper_stress",
+  "preset": "balanced",
+  "epochs": 30,
+  "max_sats": 100,
+  "train_seeds": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14
+  ],
+  "val_seeds": [
+    15,
+    16,
+    17,
+    18,
+    19
+  ],
+  "L": 20,
+  "H": 30,
+  "stride": 5,
+  "lr": 0.001,
+  "penalties": {
+    "w_switch": 0.18,
+    "w_pingpong": 0.6,
+    "w_jitter": 0.35
+  },
+  "rt_guardrails": {
+    "dwell": 3,
+    "hysteresis": 0.1,
+    "pingpong_window": 5,
+    "pingpong_extra": 0.15
+  },
+  "elapsed_sec": 19868.756447553635
+}
