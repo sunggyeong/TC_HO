@@ -135,6 +135,12 @@ class TrainEvalRealtimeConfig:
     rt_fallback_H: int = 30
     rt_debug_log: bool = False
 
+    # ---- Make-Before-Break (MBB) ----
+    # 현재 노드가 앞으로 rt_mbb_lookahead 슬롯 내에 끊길 것으로 예측되면,
+    # pending 도래 전이어도 지금 바로 pending 노드로 스위치 (sub-slot aliasing 완화)
+    rt_enable_mbb: bool = True
+    rt_mbb_lookahead: int = 1   # 몇 슬롯 앞까지 볼지 (1=바로 다음 슬롯)
+
     # 저장
     results_dir: str = "results"
     weight_path: str = "results/trained_weights_rl_real_env.pth"
@@ -616,6 +622,8 @@ def _mini_rollout_penalty(transformer, online_consistency, A_in: np.ndarray, A_t
     pp_extra_hyst = float(getattr(cfg_te, 'rt_pingpong_extra_hysteresis_ratio', 0.04))
     rel_alpha     = float(getattr(cfg_te, 'rt_reliability_alpha', 0.90))
     rel_fp_pen    = float(getattr(cfg_te, 'rt_fp_extra_penalty', 0.90))
+    use_mbb       = bool(getattr(cfg_te, 'rt_enable_mbb', True))
+    mbb_k         = int(getattr(cfg_te, 'rt_mbb_lookahead', 1))
 
     total = torch.tensor(0.0, device=device)
     sim_current      = int(current_node)
@@ -681,6 +689,21 @@ def _mini_rollout_penalty(transformer, online_consistency, A_in: np.ndarray, A_t
         else:
             k = int(getattr(cfg_te, 'rt_switch_time_offset_max', 1))
             candidate = pred_n if (pred_i <= k and 0 <= pred_n < N and A_target[t, pred_n] == 1) else sim_current
+
+        # (2-MBB) Make-Before-Break: pending 대기 중이어도 현재 노드가 곧 끊길 예정이면 조기 실행
+        if (use_pending and use_mbb
+                and candidate == sim_current          # 아직 pending 대기 중
+                and sim_current != -1
+                and 0 <= sim_current < N
+                and A_target[t, sim_current] == 1     # 지금은 살아 있지만
+                and sim_pend_exec_t != -1
+                and 0 <= sim_pend_node < N
+                and A_target[t, sim_pend_node] == 1): # pending 노드는 지금 가용
+            future_end = min(t + 1 + mbb_k, A_target.shape[0])
+            if future_end > t + 1 and np.any(A_target[t + 1 : future_end, sim_current] == 0):
+                candidate        = sim_pend_node
+                sim_pend_node    = -1
+                sim_pend_exec_t  = -1
 
         # (3) dwell + hysteresis + ping-pong extra hysteresis guardrail
         cur_valid = (sim_current != -1 and 0 <= sim_current < N and A_target[t, sim_current] == 1)
@@ -1163,6 +1186,7 @@ def build_learned_realtime_corrected_plan(
     dbg_pending_set = 0                # pending 설정/갱신 횟수
     dbg_pending_executed = 0           # 예약 시각 도래 후 실행 성공 횟수
     dbg_pending_early_fallback = 0     # 현재 연결 실패 시 pending 노드 조기 실행 횟수
+    dbg_make_before_break = 0          # MBB: 죽기 전에 미리 스위치한 횟수
 
     def _score(t_: int, n_: int) -> float:
         # utility * reliability (둘 다 0~대략 1 scale 기대)
@@ -1222,9 +1246,31 @@ def build_learned_realtime_corrected_plan(
                     _pending_exec_t = new_exec_t
                     dbg_pending_set += 1
 
-                # 예약 슬롯 도래 여부 확인
-                proposed = current_node
-                if _pending_exec_t != -1 and t >= _pending_exec_t:
+                # ---- Make-Before-Break: pending 대기 중이어도 현재 노드가 곧 끊기면 조기 실행 ----
+                mbb_k = int(getattr(cfg_te, 'rt_mbb_lookahead', 1))
+                if (getattr(cfg_te, 'rt_enable_mbb', True)
+                        and current_valid_now
+                        and _pending_exec_t != -1
+                        and t + 1 < T
+                        and 0 <= _pending_node < N
+                        and A_actual[t, _pending_node] == 1):
+                    # 다음 mbb_k 슬롯 내에 현재 노드가 끊길 것으로 예측되면 조기 실행
+                    future_end = min(t + 1 + mbb_k, T)
+                    current_dying = np.any(A_obs_corrected[t + 1 : future_end, current_node] == 0)
+                    if current_dying:
+                        _pending_node_save = int(_pending_node)
+                        _pending_node   = -1
+                        _pending_exec_t = -1
+                        proposed = _pending_node_save
+                        dbg_model_proposed += 1
+                        dbg_make_before_break += 1
+                    else:
+                        proposed = current_node
+                else:
+                    proposed = current_node
+
+                # 예약 슬롯 도래 여부 확인 (MBB가 이미 실행하지 않은 경우)
+                if proposed == current_node and _pending_exec_t != -1 and t >= _pending_exec_t:
                     pn = int(_pending_node)
                     _pending_node = -1
                     _pending_exec_t = -1
@@ -1390,6 +1436,7 @@ def build_learned_realtime_corrected_plan(
         print(f"  pending_set                = {dbg_pending_set}")
         print(f"  pending_executed           = {dbg_pending_executed}")
         print(f"  pending_early_fallback     = {dbg_pending_early_fallback}")
+        print(f"  make_before_break          = {dbg_make_before_break}")
 
     debug_stats = {
         "rt_total_slots": int(dbg_total_slots),
@@ -1401,6 +1448,7 @@ def build_learned_realtime_corrected_plan(
         "rt_pending_set": int(dbg_pending_set),
         "rt_pending_executed": int(dbg_pending_executed),
         "rt_pending_early_fallback": int(dbg_pending_early_fallback),
+        "rt_make_before_break": int(dbg_make_before_break),
     }
     den = max(1, int(dbg_model_proposed))
     debug_stats["rt_acceptance_rate"] = float(dbg_model_applied) / float(den)

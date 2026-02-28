@@ -29,7 +29,7 @@ def main():
     ap.add_argument("--test_seeds", nargs="+", type=int, default=None,
                     help="paper eval: 20..29 (10). Stored in manifest only; use eval --seeds for runs")
     ap.add_argument("--L", type=int, default=20)
-    ap.add_argument("--H", type=int, default=30)
+    ap.add_argument("--H", type=int, default=10)
     ap.add_argument("--stride", type=int, default=10)
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--reward_learnable", action="store_true", help="learn reward penalty weights during training")
@@ -40,7 +40,7 @@ def main():
     ap.add_argument("--beta_pred_action_loss",   type=float, default=1.0,
                     help="expected-reward / soft-action loss weight (default 1.0)")
     ap.add_argument("--rollout_steps",              type=int,   default=1)
-    ap.add_argument("--rollout_loss_weight",        type=float, default=0.0)
+    ap.add_argument("--rollout_loss_weight",        type=float, default=0.3)
     ap.add_argument("--reward_time_offset_penalty", type=float, default=None,
                     help="offset 패널티 강도 (default: cfg 기본값 0.02). 올리면 모델이 낮은 offset 선호")
 
@@ -55,6 +55,10 @@ def main():
                     help="override preset rt_pingpong_extra ratio")
     ap.add_argument("--no_pending",  action="store_true",
                     help="disable pending scheduler (revert to immediate semantics)")
+    ap.add_argument("--disable_mbb", action="store_true",
+                    help="disable Make-Before-Break early execution")
+    ap.add_argument("--rt_mbb_lookahead", type=int, default=None,
+                    help="MBB lookahead slots (default: cfg 기본값 1)")
 
     # --- history augmentation ---
     ap.add_argument("--disable_history_augmentation", action="store_true")
@@ -114,8 +118,11 @@ def main():
     if args.rt_pingpong_extra_hysteresis_ratio is not None:
         cfg_te.rt_pingpong_extra_hysteresis_ratio = float(args.rt_pingpong_extra_hysteresis_ratio)
 
-    # Pending scheduler (--no_pending으로 끌 수 있음)
+    # Pending scheduler / MBB
     cfg_te.rt_enable_pending = not bool(args.no_pending)
+    cfg_te.rt_enable_mbb = not bool(args.disable_mbb)
+    if args.rt_mbb_lookahead is not None:
+        cfg_te.rt_mbb_lookahead = int(args.rt_mbb_lookahead)
     cfg_te.rt_fallback_mode = "lookahead"
     cfg_te.rt_debug_log = False
 
@@ -155,6 +162,8 @@ def main():
         "rt_guardrails": {"dwell": cfg_te.rt_min_dwell, "hysteresis": cfg_te.rt_hysteresis_ratio,
                           "pingpong_window": cfg_te.rt_pingpong_window, "pingpong_extra": cfg_te.rt_pingpong_extra_hysteresis_ratio},
         "rt_enable_pending": cfg_te.rt_enable_pending,
+        "rt_enable_mbb": cfg_te.rt_enable_mbb,
+        "rt_mbb_lookahead": cfg_te.rt_mbb_lookahead,
         "elapsed_sec": time.time() - t0,
     }
     (outdir / f"train_manifest_{args.scenario}.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
