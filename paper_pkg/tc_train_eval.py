@@ -91,14 +91,14 @@ class TrainEvalRealtimeConfig:
 
     # 학습 중 보상 가중치 학습 여부 (True면 w_utility, w_outage 등이 nn.Parameter로 최적화)
     reward_learnable: bool = False
-    alpha_oracle_loss: float = 0.60
-    beta_pred_action_loss: float = 0.40
-    rollout_steps: int = 4
-    rollout_loss_weight: float = 0.35
+    alpha_oracle_loss: float = 0.5
+    beta_pred_action_loss: float = 1.5
+    rollout_steps: int = 8
+    rollout_loss_weight: float = 1.0
     train_use_history_augmentation: bool = True
     train_aug_flip_prob: float = 0.02
-    train_aug_dropout_prob: float = 0.05
-    train_aug_phase_extra: float = 0.05
+    train_aug_dropout_prob: float = 0.06
+    train_aug_phase_extra: float = 0.1
 
     # 평가 시 consistency sampling steps
     consistency_steps_eval: int = 2
