@@ -1,7 +1,7 @@
 {
   "scenario": "normal",
   "preset": "balanced",
-  "epochs": 8,
+  "epochs": 2,
   "max_sats": 100,
   "train_seeds": [
     0
@@ -30,7 +30,7 @@
   "beta_pred_action_loss": 1.0,
   "rollout_steps": 1,
   "rollout_loss_weight": 0.3,
-  "reward_time_offset_penalty": 0.02,
+  "reward_time_offset_penalty": 0.0,
   "train_use_history_augmentation": true,
   "train_aug_flip_prob": 0.02,
   "train_aug_dropout_prob": 0.06,
@@ -47,5 +47,17 @@
     "pingpong_extra": 0.15
   },
   "rt_enable_pending": true,
-  "elapsed_sec": 429.4374361038208
+  "rt_enable_mbb": true,
+  "rt_mbb_lookahead": 1,
+  "val_weights": {
+    "w_avail": 1.0,
+    "w_qoe": 0.3,
+    "w_pp": 0.5,
+    "w_hof": 0.5,
+    "w_latency": 0.08,
+    "w_jitter": 0.03,
+    "w_ho": 0.02
+  },
+  "lambda_bc": 0.02,
+  "elapsed_sec": 208.31399607658386
 }

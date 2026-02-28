@@ -29,7 +29,7 @@ def main():
     ap.add_argument("--test_seeds", nargs="+", type=int, default=None,
                     help="paper eval: 20..29 (10). Stored in manifest only; use eval --seeds for runs")
     ap.add_argument("--L", type=int, default=20)
-    ap.add_argument("--H", type=int, default=10)
+    ap.add_argument("--H", type=int, default=30)
     ap.add_argument("--stride", type=int, default=10)
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--reward_learnable", action="store_true", help="learn reward penalty weights during training")
@@ -40,9 +40,19 @@ def main():
     ap.add_argument("--beta_pred_action_loss",   type=float, default=1.0,
                     help="expected-reward / soft-action loss weight (default 1.0)")
     ap.add_argument("--rollout_steps",              type=int,   default=1)
-    ap.add_argument("--rollout_loss_weight",        type=float, default=0.3)
+    ap.add_argument("--rollout_loss_weight",        type=float, default=0.0)
     ap.add_argument("--reward_time_offset_penalty", type=float, default=None,
                     help="offset 패널티 강도 (default: cfg 기본값 0.02). 올리면 모델이 낮은 offset 선호")
+    ap.add_argument("--val_w_latency", type=float, default=None,
+                    help="validation best-score latency penalty weight")
+    ap.add_argument("--val_w_jitter", type=float, default=None,
+                    help="validation best-score jitter penalty weight")
+    ap.add_argument("--val_w_ho", type=float, default=None,
+                    help="validation best-score HO-attempt penalty weight")
+    ap.add_argument("--lambda_bc", type=float, default=None,
+                    help="behavior cloning auxiliary loss weight")
+    ap.add_argument("--rt_fallback_alpha_latency", type=float, default=None,
+                    help="runtime fallback latency penalty weight")
 
     # --- RT guardrail overrides (preset 값 위에 덮어씀) ---
     ap.add_argument("--rt_min_dwell",                     type=int,   default=None,
@@ -98,6 +108,16 @@ def main():
     cfg_te.rollout_loss_weight = float(args.rollout_loss_weight)
     if args.reward_time_offset_penalty is not None:
         cfg_te.reward_time_offset_penalty = float(args.reward_time_offset_penalty)
+    if args.val_w_latency is not None:
+        cfg_te.val_w_latency = float(args.val_w_latency)
+    if args.val_w_jitter is not None:
+        cfg_te.val_w_jitter = float(args.val_w_jitter)
+    if args.val_w_ho is not None:
+        cfg_te.val_w_ho = float(args.val_w_ho)
+    if args.lambda_bc is not None:
+        cfg_te.lambda_bc = float(args.lambda_bc)
+    if args.rt_fallback_alpha_latency is not None:
+        cfg_te.rt_fallback_alpha_latency = float(args.rt_fallback_alpha_latency)
     cfg_te.train_use_history_augmentation = not bool(args.disable_history_augmentation)
     cfg_te.train_aug_flip_prob = float(args.train_aug_flip_prob)
     cfg_te.train_aug_dropout_prob = float(args.train_aug_dropout_prob)
@@ -154,6 +174,11 @@ def main():
         "rollout_steps": cfg_te.rollout_steps,
         "rollout_loss_weight": cfg_te.rollout_loss_weight,
         "reward_time_offset_penalty": cfg_te.reward_time_offset_penalty,
+        "val_w_latency": getattr(cfg_te, "val_w_latency", None),
+        "val_w_jitter": getattr(cfg_te, "val_w_jitter", None),
+        "val_w_ho": getattr(cfg_te, "val_w_ho", None),
+        "lambda_bc": getattr(cfg_te, "lambda_bc", None),
+        "rt_fallback_alpha_latency": getattr(cfg_te, "rt_fallback_alpha_latency", None),
         "train_use_history_augmentation": cfg_te.train_use_history_augmentation,
         "train_aug_flip_prob": cfg_te.train_aug_flip_prob,
         "train_aug_dropout_prob": cfg_te.train_aug_dropout_prob,
@@ -170,8 +195,8 @@ def main():
     if hist is not None and hasattr(hist, "to_csv"):
         hist.to_csv(outdir / f"train_history_{args.scenario}.csv", index=False)
 
-    print(f"✅ saved weights: {cfg_te.weight_path}")
-    print(f"✅ manifest: {outdir / f'train_manifest_{args.scenario}.json'}")
+    print(f"[OK] saved weights: {cfg_te.weight_path}")
+    print(f"[OK] manifest: {outdir / f'train_manifest_{args.scenario}.json'}")
     print(f"Elapsed: {manifest['elapsed_sec']:.2f}s")
 
 if __name__ == "__main__":

@@ -42,30 +42,44 @@ class OnlineTransformerPredictor(nn.Module):
 # 2. Consistency Generator (Few-step 핸드오버 타겟 생성)
 # =====================================================================
 class OnlineConsistencyGenerator(nn.Module):
+    """
+    Discrete-head consistency generator.
+    - trunk: shared MLP → 64-dim hidden
+    - continuous_head: (64→2, Sigmoid) used for iterative y_noisy refinement
+    - offset_head: (64→H) raw logits for CrossEntropy / argmax inference
+    - node_head:   (64→num_nodes) raw logits for CrossEntropy / argmax inference
+    forward returns (y_refined, offset_logits, node_logits)
+    """
     def __init__(self, num_nodes, H=30, embed_dim=32):
         super().__init__()
         self.H = H
         self.num_nodes = num_nodes
-        # condition = avail_forecast(H*N) + utility_forecast(H*N) + cur_node_oh(N) + prev_node_oh(N)
         condition_dim = 2 * H * num_nodes + 2 * num_nodes
 
         self.step_mlp = nn.Sequential(
             nn.Linear(1, embed_dim), nn.ReLU(), nn.Linear(embed_dim, embed_dim)
         )
 
-        self.net = nn.Sequential(
+        self.trunk = nn.Sequential(
             nn.Linear(2 + condition_dim + embed_dim, 256),
             nn.ReLU(),
             nn.Linear(256, 64),
             nn.ReLU(),
-            nn.Linear(64, 2),
-            nn.Sigmoid()  # [time_ratio(0~1), node_ratio(0~1)]
         )
+        # continuous head for iterative y_noisy (keeps refinement loop working)
+        self.continuous_head = nn.Sequential(nn.Linear(64, 2), nn.Sigmoid())
+        # discrete classification heads (used for CE loss and argmax inference)
+        self.offset_head = nn.Linear(64, H)
+        self.node_head = nn.Linear(64, num_nodes)
 
     def forward(self, y_noisy, condition, step):
         s_embed = self.step_mlp(step)
         combined = torch.cat([y_noisy, condition, s_embed], dim=-1)
-        return self.net(combined)
+        h = self.trunk(combined)
+        y_refined = self.continuous_head(h)          # (B, 2) in [0,1]
+        offset_logits = self.offset_head(h)           # (B, H) raw logits
+        node_logits = self.node_head(h)               # (B, num_nodes) raw logits
+        return y_refined, offset_logits, node_logits
 
 
 # =====================================================================
@@ -163,13 +177,14 @@ class ProposedTCPlanner:
 
                 y_curr = torch.randn(1, 2).to(self.device)
                 steps = max(1, int(consistency_steps))
+                offset_logits = node_logits = None
                 for s_val in range(steps, 0, -1):
                     s = torch.tensor([[float(s_val)]], dtype=torch.float32, device=self.device)
-                    y_curr = self.consistency(y_curr, condition, s)
-                
-                target_time_offset = int(y_curr[0, 0].item() * (self.H - 1))
-                target_node_idx = int(y_curr[0, 1].item() * (N - 1))
-                
+                    y_curr, offset_logits, node_logits = self.consistency(y_curr, condition, s)
+
+                # discrete argmax inference
+                target_time_offset = int(offset_logits[0].argmax().item())
+                target_node_idx = int(node_logits[0].argmax().item())
                 target_time_offset = min(max(target_time_offset, 0), self.H - 1)
                 target_node_idx = min(max(target_node_idx, 0), N - 1)
 

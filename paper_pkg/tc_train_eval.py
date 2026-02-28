@@ -82,8 +82,8 @@ class TrainEvalRealtimeConfig:
     reward_guided_target_min_weight: float = 0.1
     reward_guided_target_max_weight: float = 3.0
 
-    # 설계안 B: "일찍 스위치" 유도 — i가 클수록 보상에서 추가 패널티
-    reward_time_offset_penalty: float = 0.02   # total -= penalty * i (i=0 선호)
+    # 예측형 정책이 목적이므로 offset 편향 패널티는 기본 OFF
+    reward_time_offset_penalty: float = 0.0
     reward_tie_breaker_epsilon: float = 1e-6    # 보상 차이 < eps면 같은 것으로 보고 더 작은 i 선호
 
     # 추론: target_time_offset <= k 이면 "지금/곧 스위치"로 해석 (기본 1 = 0 또는 1 슬롯 안)
@@ -141,6 +141,19 @@ class TrainEvalRealtimeConfig:
     rt_enable_mbb: bool = True
     rt_mbb_lookahead: int = 1   # 몇 슬롯 앞까지 볼지 (1=바로 다음 슬롯)
 
+    # ---- val score 가중치 ----
+    val_w_avail: float = 1.0
+    val_w_qoe: float = 0.3
+    val_w_pp: float = 0.5
+    val_w_hof: float = 0.5
+    val_w_latency: float = 0.08   # latency penalty (기준: 50ms)
+    val_w_jitter: float = 0.03    # jitter penalty (기준: 70ms)
+    val_w_ho: float = 0.02        # HO attempt penalty (기준: 300회)
+
+    # ---- BC (imitation) loss ----
+    # oracle (best_i, best_n) teacher — 반응형 잔재 없이 예측형 정책 유도용 정규화
+    lambda_bc: float = 0.02
+
     # 저장
     results_dir: str = "results"
     weight_path: str = "results/trained_weights_rl_real_env.pth"
@@ -163,6 +176,33 @@ def update_ema_target(online_net, target_net, tau=0.05):
     with torch.no_grad():
         for online_param, target_param in zip(online_net.parameters(), target_net.parameters()):
             target_param.data.copy_(tau * online_param.data + (1.0 - tau) * target_param.data)
+
+
+def _lat_scores(t: int, n_arr: np.ndarray,
+                U: np.ndarray, reliability: np.ndarray,
+                L_arr: "np.ndarray | None", alpha_lat: float) -> np.ndarray:
+    """
+    Latency-aware node scores (vectorized over n_arr):
+        score[k] = U[t, n_arr[k]] * reliability[n_arr[k]] - alpha_lat * (latency_ms[t, n_arr[k]] / 50)
+    L_arr=None → pure reliability-weighted utility (backward-compatible).
+    """
+    scores = (U[t, n_arr] * reliability[n_arr]).astype(np.float64)
+    if L_arr is not None:
+        valid = n_arr < L_arr.shape[1]
+        lat = np.zeros(len(n_arr), dtype=np.float64)
+        lat[valid] = L_arr[t, n_arr[valid]] / 50.0
+        scores -= alpha_lat * lat
+    return scores.astype(np.float32)
+
+
+def _lat_score_scalar(t: int, n: int,
+                      U: np.ndarray, reliability: np.ndarray,
+                      L_arr: "np.ndarray | None", alpha_lat: float) -> float:
+    """Scalar version of _lat_scores for a single node index."""
+    base = float(U[t, n] * reliability[n])
+    if L_arr is not None and n < L_arr.shape[1]:
+        return base - alpha_lat * float(L_arr[t, n]) / 50.0
+    return base
 
 
 def _build_consistency_condition(
@@ -209,7 +249,7 @@ def save_weights(transformer, consistency, weight_path: str, reward_weights_modu
     if reward_weights_module is not None:
         payload["reward_weights_state_dict"] = reward_weights_module.state_dict()
     torch.save(payload, weight_path)
-    print(f"✅ weights saved: {weight_path}")
+    print(f"[OK] weights saved: {weight_path}")
 
 
 def load_weights(transformer, consistency, weight_path: str, device: torch.device):
@@ -586,15 +626,17 @@ def _augment_history_matrix(history_A: np.ndarray, actual_env, t: int, cfg_te: T
     return aug
 
 
-def _soft_expected_action_loss(y_curr: torch.Tensor, future_A_true: np.ndarray, future_U_true: np.ndarray,
+def _soft_expected_action_loss(offset_logits: torch.Tensor, node_logits: torch.Tensor,
+                               future_A_true: np.ndarray, future_U_true: np.ndarray,
                                current_node: int, prev_node: int, cfg_te: TrainEvalRealtimeConfig) -> torch.Tensor:
+    """Expected-reward loss using softmax distributions over discrete logits."""
     H = future_A_true.shape[0]
     N = future_A_true.shape[1]
-    logits_t = -((torch.arange(H, device=y_curr.device, dtype=torch.float32) / max(1, H - 1)) - y_curr[0, 0]) ** 2 * 24.0
-    logits_n = -((torch.arange(N, device=y_curr.device, dtype=torch.float32) / max(1, N - 1)) - y_curr[0, 1]) ** 2 * 24.0
-    pt = torch.softmax(logits_t, dim=0)
-    pn = torch.softmax(logits_n, dim=0)
-    rewards = torch.zeros((H, N), dtype=torch.float32, device=y_curr.device)
+    device = offset_logits.device
+    # Use softmax of discrete logits directly as action probabilities
+    pt = F.softmax(offset_logits[0, :H], dim=0)   # (H,)
+    pn = F.softmax(node_logits[0, :N], dim=0)      # (N,)
+    rewards = torch.zeros((H, N), dtype=torch.float32, device=device)
     for i in range(H):
         for n in range(N):
             rewards[i, n] = _reward_for_action(future_A_true, future_U_true, i, n, current_node, prev_node, cfg_te)
@@ -602,14 +644,17 @@ def _soft_expected_action_loss(y_curr: torch.Tensor, future_A_true: np.ndarray, 
     return -expected_reward
 
 
-def _mini_rollout_penalty(transformer, online_consistency, A_in: np.ndarray, A_target: np.ndarray, U_target: np.ndarray,
-                          t_start: int, current_node: int, prev_node: int, cfg_te: TrainEvalRealtimeConfig, device: torch.device) -> torch.Tensor:
+def _mini_rollout_penalty(transformer, online_consistency,
+                          A_in: np.ndarray, A_target: np.ndarray, U_target: np.ndarray,
+                          t_start: int, current_node: int, prev_node: int,
+                          cfg_te: TrainEvalRealtimeConfig, device: torch.device,
+                          L_target: "np.ndarray | None" = None) -> torch.Tensor:
     """
     RT-corrected plan과 semantics를 맞춘 rollout 시뮬레이터.
     - pending 예약 → 도래 시 실행 (rt_enable_pending)
-    - reliability EMA (RT 플래너와 동일한 공식)로 가중된 fallback 점수
+    - latency-aware reliability score (_lat_scores) 로 모든 후보 선택
     - dwell + hysteresis + ping-pong extra hysteresis guardrail
-    - 현재 연결 실패 시 pending 조기 실행 → 없으면 reliability-aware greedy fallback
+    - 현재 연결 실패 시 pending 조기 실행 → 없으면 latency-aware greedy fallback
     gradient는 y_curr → _soft_expected_action_loss 경로로만 흐름; 상태전이는 numpy/int.
     """
     L, H = cfg_te.L, cfg_te.H
@@ -624,6 +669,7 @@ def _mini_rollout_penalty(transformer, online_consistency, A_in: np.ndarray, A_t
     rel_fp_pen    = float(getattr(cfg_te, 'rt_fp_extra_penalty', 0.90))
     use_mbb       = bool(getattr(cfg_te, 'rt_enable_mbb', True))
     mbb_k         = int(getattr(cfg_te, 'rt_mbb_lookahead', 1))
+    alpha_lat     = float(cfg_te.rt_fallback_alpha_latency)
 
     total = torch.tensor(0.0, device=device)
     sim_current      = int(current_node)
@@ -637,7 +683,7 @@ def _mini_rollout_penalty(transformer, online_consistency, A_in: np.ndarray, A_t
     sim_reliability = np.ones(N, dtype=np.float32)
 
     def _rel_score(t_: int, n_: int) -> float:
-        return float(U_target[t_, n_] * sim_reliability[n_])
+        return _lat_score_scalar(t_, n_, U_target, sim_reliability, L_target, alpha_lat)
 
     sim_hist = np.array(A_in[max(0, t_start - L):t_start, :], copy=True)
     if sim_hist.shape[0] < L:
@@ -658,11 +704,11 @@ def _mini_rollout_penalty(transformer, online_consistency, A_in: np.ndarray, A_t
         )
         condition = _build_consistency_condition(avail_flat, u_slice, sim_current, sim_prev, N, device)
         y_noisy = torch.randn(1, 2, device=device)
-        y_curr  = online_consistency(y_noisy, condition, torch.tensor([[1.0]], device=device))
-        total   = total + _soft_expected_action_loss(y_curr, A_target[t:t+H, :], U_target[t:t+H, :], sim_current, sim_prev, cfg_te)
+        _, offset_logits, node_logits = online_consistency(y_noisy, condition, torch.tensor([[1.0]], device=device))
+        total = total + _soft_expected_action_loss(offset_logits, node_logits, A_target[t:t+H, :], U_target[t:t+H, :], sim_current, sim_prev, cfg_te)
 
-        pred_i = int(torch.clamp((y_curr[0, 0] * (H - 1)).round(), 0, H - 1).item())
-        pred_n = int(torch.clamp((y_curr[0, 1] * (N - 1)).round(), 0, N - 1).item())
+        pred_i = int(offset_logits[0].argmax().item())
+        pred_n = int(node_logits[0].argmax().item())
 
         # ---- 상태 전이: RT-corrected 플래너 semantics ----
         if use_pending:
@@ -672,7 +718,7 @@ def _mini_rollout_penalty(transformer, online_consistency, A_in: np.ndarray, A_t
                 sim_pend_node   = pred_n
                 sim_pend_exec_t = new_exec_t
 
-            # (2) pending 도래 시 실행 (reliability-aware fallback 포함)
+            # (2) pending 도래 시 실행 (latency-aware fallback 포함)
             candidate = sim_current
             if sim_pend_exec_t != -1 and t >= sim_pend_exec_t:
                 pn = sim_pend_node
@@ -684,7 +730,7 @@ def _mini_rollout_penalty(transformer, online_consistency, A_in: np.ndarray, A_t
                     avail_now = np.where(A_target[t] == 1)[0]
                     if len(avail_now) > 0:
                         candidate = int(avail_now[np.argmax(
-                            U_target[t, avail_now] * sim_reliability[avail_now]
+                            _lat_scores(t, avail_now, U_target, sim_reliability, L_target, alpha_lat)
                         )])
         else:
             k = int(getattr(cfg_te, 'rt_switch_time_offset_max', 1))
@@ -737,11 +783,13 @@ def _mini_rollout_penalty(transformer, online_consistency, A_in: np.ndarray, A_t
                 sim_pend_exec_t = -1
                 sim_last_switch = t
             else:
-                # reliability-aware greedy fallback
+                # latency-aware greedy fallback
                 avail_now = np.where(A_target[t] == 1)[0]
                 sim_prev2   = sim_prev
                 sim_prev    = sim_current
-                sim_current = int(avail_now[np.argmax(U_target[t, avail_now] * sim_reliability[avail_now])]) if len(avail_now) > 0 else -1
+                sim_current = int(avail_now[np.argmax(
+                    _lat_scores(t, avail_now, U_target, sim_reliability, L_target, alpha_lat)
+                )]) if len(avail_now) > 0 else -1
                 sim_last_switch = t
 
         # (5) reliability EMA 업데이트 (RT 플래너와 동일한 공식)
@@ -837,6 +885,8 @@ def train_on_seed_pool(
             A_in = np.asarray(pred_env.A_final, dtype=np.float32)
             A_target = np.asarray(actual_env.A_final, dtype=np.float32)
             U_target = np.asarray(actual_env.utility, dtype=np.float32)
+            _L_raw = getattr(actual_env, 'latency_ms', None)
+            L_target = np.asarray(_L_raw) if _L_raw is not None else None
             T, N2 = A_in.shape
             if N2 != N:
                 raise ValueError(f'num_nodes mismatch in training: expected {N}, got {N2}')
@@ -860,7 +910,7 @@ def train_on_seed_pool(
                 )
                 y_noisy_t2 = torch.randn(1, 2, device=device)
                 y_noisy_t1 = y_noisy_t2 * 0.5
-                y_curr = online_consistency(y_noisy_t1, condition, torch.tensor([[1.0]], device=device))
+                y_curr, offset_logits, node_logits = online_consistency(y_noisy_t1, condition, torch.tensor([[1.0]], device=device))
 
                 if reward_weights_module is not None:
                     w_u, w_o, w_s, w_r, w_j, w_p = reward_weights_module.to_numpy_weights()
@@ -883,20 +933,35 @@ def train_on_seed_pool(
                     rl_weight_torch = _reward_to_supervision_weight(reward_val, cfg_te)
 
                 epoch_reward += float(reward_val)
-                y_star = torch.tensor([[0.0 if H <= 1 else best_i / float(H - 1), 0.0 if N <= 1 else best_n / float(N - 1)]], dtype=torch.float32, device=device)
-                loss_oracle = rl_weight_torch * F.mse_loss(y_curr, y_star)
-                loss_pred = _soft_expected_action_loss(y_curr, future_A_true, U_target[t:t+H, :], current_node_approx, prev_node_approx, cfg_te)
-                loss_rollout = _mini_rollout_penalty(transformer, online_consistency, A_in, A_target, U_target, t, current_node_approx, prev_node_approx, cfg_te, device)
+                # Oracle loss: CrossEntropy on discrete heads (replaces MSE on continuous ratio)
+                best_i_t = torch.tensor([best_i], dtype=torch.long, device=device)
+                best_n_t = torch.tensor([best_n], dtype=torch.long, device=device)
+                loss_oracle = rl_weight_torch * (
+                    F.cross_entropy(offset_logits, best_i_t) +
+                    F.cross_entropy(node_logits, best_n_t)
+                )
+                loss_pred = _soft_expected_action_loss(offset_logits, node_logits, future_A_true, U_target[t:t+H, :], current_node_approx, prev_node_approx, cfg_te)
+                loss_rollout = _mini_rollout_penalty(transformer, online_consistency, A_in, A_target, U_target, t, current_node_approx, prev_node_approx, cfg_te, device, L_target=L_target)
                 loss_rl = float(getattr(cfg_te, 'alpha_oracle_loss', 0.6)) * loss_oracle + float(getattr(cfg_te, 'beta_pred_action_loss', 0.4)) * loss_pred + float(getattr(cfg_te, 'rollout_loss_weight', 0.35)) * loss_rollout
 
-                pred_i = int(torch.clamp((y_curr[0, 0] * (H - 1)).round(), 0, H - 1).item())
-                pred_n = int(torch.clamp((y_curr[0, 1] * (N - 1)).round(), 0, N - 1).item())
+                # BC (imitation) loss: teacher = oracle (best_i, best_n) — RT-semantics target
+                # 현재 슬롯 greedy(reactive)가 아닌 reward-optimal 예측형 타겟을 사용해
+                # pending/예약형 정책 학습과 충돌 없이 안정화 효과만 제공
+                loss_bc = (
+                    F.cross_entropy(offset_logits, best_i_t) +
+                    F.cross_entropy(node_logits, best_n_t)
+                )
+
+                # discrete argmax for pred reward tracking
+                pred_i = int(offset_logits[0].argmax().item())
+                pred_n = int(node_logits[0].argmax().item())
                 epoch_pred_reward += _reward_for_action(future_A_true, U_target[t:t+H, :], pred_i, pred_n, current_node_approx, prev_node_approx, cfg_te)
 
                 with torch.no_grad():
-                    y_target = target_consistency(y_noisy_t2, condition, torch.tensor([[2.0]], device=device))
+                    y_target, _, _ = target_consistency(y_noisy_t2, condition, torch.tensor([[2.0]], device=device))
                 loss_cs = F.mse_loss(y_curr, y_target)
-                total_loss = loss_tf + loss_rl + (cfg_te.lambda_consistency * loss_cs)
+                lambda_bc_val = float(getattr(cfg_te, 'lambda_bc', 0.1))
+                total_loss = loss_tf + loss_rl + (cfg_te.lambda_consistency * loss_cs) + lambda_bc_val * loss_bc
                 total_loss.backward()
                 torch.nn.utils.clip_grad_norm_(list(transformer.parameters()) + list(online_consistency.parameters()), 1.0)
                 optimizer.step()
@@ -931,8 +996,25 @@ def train_on_seed_pool(
                 val_qoe = float(df_val['EffectiveQoE'].mean())
                 val_pp = float(df_val['PingPong_Ratio'].mean())
                 val_hof = float(df_val['HO_Failure_Ratio'].mean())
-                val_score = val_avail + 0.3 * val_qoe - 0.5 * val_pp - 0.5 * val_hof
+                val_latency = float(df_val['MeanLatency_ms'].mean()) if 'MeanLatency_ms' in df_val.columns else 50.0
+                val_jitter  = float(df_val['MeanJitter_ms'].mean())  if 'MeanJitter_ms'  in df_val.columns else 70.0
+                val_ho      = float(df_val['HO_Attempt_Count'].mean()) if 'HO_Attempt_Count' in df_val.columns else 300.0
+                lat_pen = val_latency / 50.0
+                jit_pen = val_jitter  / 70.0
+                ho_pen  = val_ho      / 300.0
+                val_score = (
+                    cfg_te.val_w_avail   * val_avail
+                    + cfg_te.val_w_qoe   * val_qoe
+                    - cfg_te.val_w_pp    * val_pp
+                    - cfg_te.val_w_hof   * val_hof
+                    - cfg_te.val_w_latency * lat_pen
+                    - cfg_te.val_w_jitter  * jit_pen
+                    - cfg_te.val_w_ho      * ho_pen
+                )
                 row['val_score'] = val_score
+                row['val_latency'] = val_latency
+                row['val_jitter'] = val_jitter
+                row['val_ho'] = val_ho
                 if len(df_dbg) > 0:
                     row["val_rt_acceptance_rate"] = float(df_dbg["rt_acceptance_rate"].mean())
                     row["val_rt_fallback_rate"] = float(df_dbg["rt_fallback_rate"].mean())
@@ -955,6 +1037,7 @@ def train_on_seed_pool(
                     f"score={val_score:.4f} | "
                     f"Avail={val_avail:.4f} | QoE={val_qoe:.4f} | "
                     f"PP={val_pp:.4f} | HOF={val_hof:.4f} | "
+                    f"Lat={val_latency:.1f}ms | Jit={val_jitter:.1f}ms | HO={val_ho:.0f} | "
                     f"accept={row['val_rt_acceptance_rate']:.3f} | "
                     f"fallback={row['val_rt_fallback_rate']:.3f} | "
                     f"block={row['val_rt_guardrail_block_rate']:.3f}",
@@ -1011,15 +1094,15 @@ def _predict_target_from_history(
         )
 
         y_curr = torch.randn(1, 2, device=device)
-
+        offset_logits = node_logits = None
         steps = max(1, int(consistency_steps))
         for s in range(steps, 0, -1):
             step_tensor = torch.tensor([[float(s)]], dtype=torch.float32, device=device)
-            y_curr = consistency(y_curr, condition, step_tensor)
+            y_curr, offset_logits, node_logits = consistency(y_curr, condition, step_tensor)
 
-        target_time_offset = int(y_curr[0, 0].item() * (H - 1))
-        target_node_idx = int(y_curr[0, 1].item() * (N - 1))
-
+        # discrete argmax inference
+        target_time_offset = int(offset_logits[0].argmax().item())
+        target_node_idx = int(node_logits[0].argmax().item())
         target_time_offset = min(max(target_time_offset, 0), H - 1)
         target_node_idx = min(max(target_node_idx, 0), N - 1)
 
@@ -1150,6 +1233,10 @@ def build_learned_realtime_corrected_plan(
     U_actual = np.asarray(actual_env.utility)
     A_pred = np.asarray(pred_env.A_final)
     U_pred = np.asarray(pred_env.utility)
+    # per-slot per-node latency (ms) — used in fallback score to prefer lower-latency nodes
+    _L_actual_raw = getattr(actual_env, 'latency_ms', None)
+    L_actual = np.asarray(_L_actual_raw) if _L_actual_raw is not None else None
+    _alpha_lat = float(cfg_te.rt_fallback_alpha_latency)
 
     T, N = A_actual.shape
     N_model = getattr(transformer, "num_nodes", N)
@@ -1189,8 +1276,12 @@ def build_learned_realtime_corrected_plan(
     dbg_make_before_break = 0          # MBB: 죽기 전에 미리 스위치한 횟수
 
     def _score(t_: int, n_: int) -> float:
-        # utility * reliability (둘 다 0~대략 1 scale 기대)
-        return float(U_actual[t_, n_] * reliability[n_])
+        # utility * reliability — latency penalty (alpha_lat * latency_ms / 50ms baseline)
+        base = float(U_actual[t_, n_] * reliability[n_])
+        if L_actual is not None and n_ < L_actual.shape[1]:
+            lat_pen = float(L_actual[t_, n_]) / 50.0
+            return base - _alpha_lat * lat_pen
+        return base
 
     for t in range(T):
         # 현재 슬롯까지는 실제 관측값 사용 가능하다고 가정(실시간 측정)
@@ -1204,11 +1295,10 @@ def build_learned_realtime_corrected_plan(
 
         # ------------------------ (A) 기본 제안 산출 ------------------------
         if t < L:
-            # warmup: 현재 실제 가용 후보 중 신뢰도 반영 점수 최대 선택
+            # warmup: latency-aware 신뢰도 점수 최대 선택
             avail = np.where(A_actual[t] == 1)[0]
             if len(avail) > 0:
-                score = U_actual[t, avail] * reliability[avail]
-                proposed = int(avail[np.argmax(score)])
+                proposed = int(avail[np.argmax(_lat_scores(t, avail, U_actual, reliability, L_actual, _alpha_lat))])
             else:
                 proposed = -1
 
@@ -1280,10 +1370,10 @@ def build_learned_realtime_corrected_plan(
                         dbg_model_proposed += 1
                         dbg_pending_executed += 1
                     else:
-                        # 예약 노드 불가 → 실행 시점의 최우선 가용 노드로 대체 실행
+                        # 예약 노드 불가 → latency-aware 최우선 가용 노드로 대체 실행
                         avail_now = np.where(A_actual[t] == 1)[0]
                         if len(avail_now) > 0:
-                            best = int(avail_now[np.argmax(U_actual[t, avail_now] * reliability[avail_now])])
+                            best = int(avail_now[np.argmax(_lat_scores(t, avail_now, U_actual, reliability, L_actual, _alpha_lat))])
                             if best != current_node:
                                 proposed = best
                                 dbg_model_proposed += 1
@@ -1331,9 +1421,8 @@ def build_learned_realtime_corrected_plan(
                 elif cfg_te.rt_use_actual_current_slot_fallback:
                     avail = np.where(A_actual[t] == 1)[0]
                     if len(avail) > 0:
-                        # 신뢰도 반영 + 현재 actual utility 기반 즉시 보정
-                        score = U_actual[t, avail] * reliability[avail]
-                        fallback = int(avail[np.argmax(score)])
+                        # latency-aware 신뢰도 + utility 기반 즉시 보정
+                        fallback = int(avail[np.argmax(_lat_scores(t, avail, U_actual, reliability, L_actual, _alpha_lat))])
 
                         # 현재 연결 유지가 유효하고 제안이 low_rel이면 유지를 우선할 수도 있음
                         if current_valid_now and low_rel:
