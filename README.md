@@ -12,6 +12,19 @@ LEO 위성 핸드오버 시점 최적화를 위한 Transformer + Consistency(TC)
 - skyfield, networkx (환경·DAG 베이스라인)
 - 프로젝트 내 `providers`, `envs`, `baselines`, `models`(또는 `proposed_tc_planner`) 모듈
 
+### 빠른 설치 (pip)
+
+```bash
+pip install numpy pandas networkx skyfield
+```
+
+PyTorch는 사용 환경(CPU/GPU)에 맞게 설치하세요.
+
+```bash
+# CPU 예시
+pip install torch --index-url https://download.pytorch.org/whl/cpu
+```
+
 TLE 기반 궤도/가시성 계산을 위해 **`data/starlink_frozen_20260224_1410Z.tle`** 파일이 필요합니다.  
 (`env_core.ExperimentConfig.tle_path` 기본값과 동일한 경로에 두면 됩니다.)
 

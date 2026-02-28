@@ -63,7 +63,7 @@ class TrainEvalRealtimeConfig:
     H: int = 30
     epochs: int = 3
     stride: int = 5
-    lr: float = 1e-3
+    lr: float = 5e-4
     lambda_consistency: float = 1.0
     reward_invalid_penalty: float = -1.0
 
