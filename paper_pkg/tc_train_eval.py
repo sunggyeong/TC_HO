@@ -94,7 +94,7 @@ class TrainEvalRealtimeConfig:
     alpha_oracle_loss: float = 0.3
     beta_pred_action_loss: float = 1.0
     rollout_steps: int = 1
-    rollout_loss_weight: float = 0.0
+    rollout_loss_weight: float = 0.2
     train_use_history_augmentation: bool = True
     train_aug_flip_prob: float = 0.02
     train_aug_dropout_prob: float = 0.06
@@ -598,39 +598,139 @@ def _soft_expected_action_loss(y_curr: torch.Tensor, future_A_true: np.ndarray, 
 
 def _mini_rollout_penalty(transformer, online_consistency, A_in: np.ndarray, A_target: np.ndarray, U_target: np.ndarray,
                           t_start: int, current_node: int, prev_node: int, cfg_te: TrainEvalRealtimeConfig, device: torch.device) -> torch.Tensor:
+    """
+    RT-corrected plan과 semantics를 맞춘 rollout 시뮬레이터.
+    - pending 예약 → 도래 시 실행 (rt_enable_pending)
+    - reliability EMA (RT 플래너와 동일한 공식)로 가중된 fallback 점수
+    - dwell + hysteresis + ping-pong extra hysteresis guardrail
+    - 현재 연결 실패 시 pending 조기 실행 → 없으면 reliability-aware greedy fallback
+    gradient는 y_curr → _soft_expected_action_loss 경로로만 흐름; 상태전이는 numpy/int.
+    """
     L, H = cfg_te.L, cfg_te.H
     K = max(1, int(getattr(cfg_te, 'rollout_steps', 4)))
+    N = A_target.shape[1]
+    use_pending   = bool(getattr(cfg_te, 'rt_enable_pending', True))
+    min_dwell     = int(getattr(cfg_te, 'rt_min_dwell', 3))
+    hyst_ratio    = float(getattr(cfg_te, 'rt_hysteresis_ratio', 0.08))
+    pp_window     = int(getattr(cfg_te, 'rt_pingpong_window', 4))
+    pp_extra_hyst = float(getattr(cfg_te, 'rt_pingpong_extra_hysteresis_ratio', 0.04))
+    rel_alpha     = float(getattr(cfg_te, 'rt_reliability_alpha', 0.90))
+    rel_fp_pen    = float(getattr(cfg_te, 'rt_fp_extra_penalty', 0.90))
+
     total = torch.tensor(0.0, device=device)
-    sim_current = int(current_node)
-    sim_prev = int(prev_node)
+    sim_current      = int(current_node)
+    sim_prev         = int(prev_node)      # t-1 노드 (ping-pong 감지용)
+    sim_prev2        = -1                  # t-2 노드 (ping-pong 감지용)
+    sim_last_switch  = -10**9
+    sim_pend_node    = -1
+    sim_pend_exec_t  = -1
+
+    # reliability 초기값: 1.0 (RT 플래너와 동일)
+    sim_reliability = np.ones(N, dtype=np.float32)
+
+    def _rel_score(t_: int, n_: int) -> float:
+        return float(U_target[t_, n_] * sim_reliability[n_])
+
     sim_hist = np.array(A_in[max(0, t_start - L):t_start, :], copy=True)
     if sim_hist.shape[0] < L:
-        pad = np.zeros((L - sim_hist.shape[0], A_in.shape[1]), dtype=np.float32)
+        pad = np.zeros((L - sim_hist.shape[0], N), dtype=np.float32)
         sim_hist = np.vstack([pad, sim_hist])
+
     for offs in range(K):
         t = t_start + offs
         if t >= A_target.shape[0] - H:
             break
+
         hist = _augment_history_matrix(sim_hist, SimpleNamespace(phase=getattr(SimpleNamespace(), 'phase', None)), t, cfg_te)
         state_tensor = torch.tensor(hist, dtype=torch.float32, device=device).unsqueeze(0)
         future_pred = transformer(state_tensor)
-        avail_flat = future_pred.view(1, -1).detach()
+        avail_flat  = future_pred.view(1, -1).detach()
         u_slice = U_target[t:t+H, :] if t + H <= U_target.shape[0] else np.pad(
             U_target[t:, :], ((0, t + H - U_target.shape[0]), (0, 0))
         )
-        condition = _build_consistency_condition(
-            avail_flat, u_slice, sim_current, sim_prev, A_target.shape[1], device
-        )
+        condition = _build_consistency_condition(avail_flat, u_slice, sim_current, sim_prev, N, device)
         y_noisy = torch.randn(1, 2, device=device)
-        y_curr = online_consistency(y_noisy, condition, torch.tensor([[1.0]], device=device))
-        total = total + _soft_expected_action_loss(y_curr, A_target[t:t+H, :], U_target[t:t+H, :], sim_current, sim_prev, cfg_te)
+        y_curr  = online_consistency(y_noisy, condition, torch.tensor([[1.0]], device=device))
+        total   = total + _soft_expected_action_loss(y_curr, A_target[t:t+H, :], U_target[t:t+H, :], sim_current, sim_prev, cfg_te)
+
         pred_i = int(torch.clamp((y_curr[0, 0] * (H - 1)).round(), 0, H - 1).item())
-        pred_n = int(torch.clamp((y_curr[0, 1] * (A_target.shape[1] - 1)).round(), 0, A_target.shape[1] - 1).item())
-        if pred_i <= int(getattr(cfg_te, 'rt_switch_time_offset_max', 1)) and A_target[t, pred_n] == 1:
-            sim_prev, sim_current = sim_current, pred_n
+        pred_n = int(torch.clamp((y_curr[0, 1] * (N - 1)).round(), 0, N - 1).item())
+
+        # ---- 상태 전이: RT-corrected 플래너 semantics ----
+        if use_pending:
+            # (1) pending 갱신: 더 이른 예약이면 교체
+            new_exec_t = t + pred_i
+            if sim_pend_exec_t == -1 or new_exec_t <= sim_pend_exec_t:
+                sim_pend_node   = pred_n
+                sim_pend_exec_t = new_exec_t
+
+            # (2) pending 도래 시 실행 (reliability-aware fallback 포함)
+            candidate = sim_current
+            if sim_pend_exec_t != -1 and t >= sim_pend_exec_t:
+                pn = sim_pend_node
+                sim_pend_node   = -1
+                sim_pend_exec_t = -1
+                if 0 <= pn < N and A_target[t, pn] == 1:
+                    candidate = pn
+                else:
+                    avail_now = np.where(A_target[t] == 1)[0]
+                    if len(avail_now) > 0:
+                        candidate = int(avail_now[np.argmax(
+                            U_target[t, avail_now] * sim_reliability[avail_now]
+                        )])
+        else:
+            k = int(getattr(cfg_te, 'rt_switch_time_offset_max', 1))
+            candidate = pred_n if (pred_i <= k and 0 <= pred_n < N and A_target[t, pred_n] == 1) else sim_current
+
+        # (3) dwell + hysteresis + ping-pong extra hysteresis guardrail
+        cur_valid = (sim_current != -1 and 0 <= sim_current < N and A_target[t, sim_current] == 1)
+        if candidate != sim_current and candidate != -1 and 0 <= candidate < N and A_target[t, candidate] == 1:
+            if (t - sim_last_switch) >= min_dwell:
+                s_cur = _rel_score(t, sim_current) if cur_valid else -1e9
+                s_new = _rel_score(t, candidate)
+                required = hyst_ratio
+                # ping-pong(A->B->A) 감지: candidate가 t-2 노드이고 최근 스위치 직후면 추가 hysteresis
+                is_pp = (
+                    candidate == sim_prev2
+                    and sim_prev2 != -1
+                    and sim_prev == sim_current
+                    and (t - sim_last_switch) <= pp_window
+                )
+                if is_pp:
+                    required += pp_extra_hyst
+                if not cur_valid or s_new >= s_cur * (1.0 + required):
+                    sim_prev2       = sim_prev
+                    sim_prev        = sim_current
+                    sim_current     = candidate
+                    sim_last_switch = t
+
+        # (4) 현재 연결 실패 처리
         if sim_current != -1 and A_target[t, sim_current] == 0:
-            sim_prev, sim_current = sim_current, -1
+            if use_pending and sim_pend_exec_t != -1 and 0 <= sim_pend_node < N and A_target[t, sim_pend_node] == 1:
+                sim_prev2       = sim_prev
+                sim_prev        = sim_current
+                sim_current     = sim_pend_node
+                sim_pend_node   = -1
+                sim_pend_exec_t = -1
+                sim_last_switch = t
+            else:
+                # reliability-aware greedy fallback
+                avail_now = np.where(A_target[t] == 1)[0]
+                sim_prev2   = sim_prev
+                sim_prev    = sim_current
+                sim_current = int(avail_now[np.argmax(U_target[t, avail_now] * sim_reliability[avail_now])]) if len(avail_now) > 0 else -1
+                sim_last_switch = t
+
+        # (5) reliability EMA 업데이트 (RT 플래너와 동일한 공식)
+        # rollout은 A_target을 "미래 정답"으로 쓰므로 predicted와 actual 모두 A_target으로 근사
+        match = np.ones(N, dtype=np.float32)   # A_target 기준 self-consistent → match=1 기본
+        fp_mask = (A_in[t] == 1) & (A_target[t] == 0) if t < A_in.shape[0] else np.zeros(N, dtype=bool)
+        sim_reliability = rel_alpha * sim_reliability + (1.0 - rel_alpha) * match
+        sim_reliability[fp_mask] *= rel_fp_pen
+        sim_reliability = np.clip(sim_reliability, 0.05, 1.0)
+
         sim_hist = np.vstack([sim_hist[1:], A_in[t:t+1, :]])
+
     return total / float(K)
 
 

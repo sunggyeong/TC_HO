@@ -1,13 +1,16 @@
 {
   "scenario": "paper_stress",
   "preset": "balanced",
-  "epochs": 3,
+  "epochs": 5,
   "max_sats": 100,
   "train_seeds": [
-    0
+    0,
+    1,
+    2
   ],
   "val_seeds": [
-    1
+    3,
+    4
   ],
   "test_seeds": [
     20,
@@ -23,17 +26,17 @@
   ],
   "L": 20,
   "H": 30,
-  "stride": 5,
+  "stride": 10,
   "lr": 0.001,
   "reward_learnable": false,
-  "alpha_oracle_loss": 1.0,
-  "beta_pred_action_loss": 0.25,
-  "history_augmentation": {
-    "enabled": true,
-    "flip_prob": 0.02,
-    "dropout_prob": 0.03,
-    "phase_extra": 0.06
-  },
+  "alpha_oracle_loss": 0.3,
+  "beta_pred_action_loss": 1.0,
+  "rollout_steps": 1,
+  "rollout_loss_weight": 0.0,
+  "train_use_history_augmentation": true,
+  "train_aug_flip_prob": 0.02,
+  "train_aug_dropout_prob": 0.06,
+  "train_aug_phase_extra": 0.1,
   "penalties": {
     "w_switch": 0.18,
     "w_pingpong": 0.6,
@@ -45,5 +48,6 @@
     "pingpong_window": 5,
     "pingpong_extra": 0.15
   },
-  "elapsed_sec": 1069.2396335601807
+  "rt_enable_pending": true,
+  "elapsed_sec": 1616.7633938789368
 }

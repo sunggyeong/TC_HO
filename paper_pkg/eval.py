@@ -61,6 +61,9 @@ def load_models(weights: str, exp_cfg: ExperimentConfig, outdir: Path):
     cfg_te.exp_cfg = exp_cfg
     cfg_te.results_dir = str(outdir)
     cfg_te.weight_path = weights
+    # L, H를 cfg_te에도 반영해야 plan builder들이 올바른 H로 condition 벡터를 만든다
+    cfg_te.L = L
+    cfg_te.H = H
     transformer = tc.OnlineTransformerPredictor(num_nodes=N, L=L, H=H).to(device)
     consistency = tc.OnlineConsistencyGenerator(num_nodes=N, H=H).to(device)
     transformer.load_state_dict(ckpt["transformer_state_dict"])
@@ -79,6 +82,7 @@ def main():
     ap.add_argument("--max_sats", type=int, default=None)
     ap.add_argument("--save_timelines", action="store_true")
     ap.add_argument("--rt_debug", action="store_true", help="print RTCorrected debug counters")
+    ap.add_argument("--phase_breakdown", action="store_true")
     args = ap.parse_args()
 
     preset = PRESETS[args.preset]
@@ -114,12 +118,26 @@ def main():
         print("ℹ️ baselines only (no TC weights)")
 
     rows: List[Dict[str, Any]] = []
+    phase_rows: List[Dict[str, Any]] = []
     t0 = time.time()
     first_seed = int(args.seeds[0])
 
     for seed in args.seeds:
         actual = build_env(exp_cfg, seed=seed, predicted_view=False)
         pred = build_env(exp_cfg, seed=seed, predicted_view=True)
+
+        if args.phase_breakdown:
+            phase_arr = getattr(actual, "phase", None)
+            if phase_arr is not None:
+                unique_ph = np.unique(phase_arr)
+                for ph in unique_ph:
+                    mask = (phase_arr == ph)
+                    phase_rows.append({
+                        "seed": seed,
+                        "phase": str(ph),
+                        "slots": int(mask.sum()),
+                        "mean_visible_nodes": float(np.asarray(actual.A_final)[mask].sum(axis=1).mean()) if mask.any() else 0.0,
+                    })
 
         A_act = np.asarray(actual.A_final); U_act = np.asarray(actual.utility); L_act = np.asarray(actual.latency_ms)
         A_pred = np.asarray(pred.A_final); U_pred = np.asarray(pred.utility); L_pred = np.asarray(pred.latency_ms)
@@ -167,6 +185,10 @@ def main():
     df_summary = summarize_runs(df_runs)
     out_summary = _safe_write_csv(df_summary, outdir / "exp_paper_summary.csv")
     print(f"[OK] saved summary: {out_summary.resolve()}")
+    if args.phase_breakdown and len(phase_rows) > 0:
+        df_phase = pd.DataFrame(phase_rows)
+        out_phase = _safe_write_csv(df_phase, outdir / "exp_paper_phase_breakdown.csv")
+        print(f"[OK] saved phase breakdown: {out_phase.resolve()}")
     print(f"Elapsed: {time.time()-t0:.2f}s")
 
 if __name__ == "__main__":

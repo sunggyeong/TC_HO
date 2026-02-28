@@ -39,8 +39,10 @@ def main():
                     help="oracle point-regression loss weight (default 0.3)")
     ap.add_argument("--beta_pred_action_loss",   type=float, default=1.0,
                     help="expected-reward / soft-action loss weight (default 1.0)")
-    ap.add_argument("--rollout_steps",           type=int,   default=1)
-    ap.add_argument("--rollout_loss_weight",     type=float, default=0.0)
+    ap.add_argument("--rollout_steps",              type=int,   default=1)
+    ap.add_argument("--rollout_loss_weight",        type=float, default=0.0)
+    ap.add_argument("--reward_time_offset_penalty", type=float, default=None,
+                    help="offset 패널티 강도 (default: cfg 기본값 0.02). 올리면 모델이 낮은 offset 선호")
 
     # --- RT guardrail overrides (preset 값 위에 덮어씀) ---
     ap.add_argument("--rt_min_dwell",                     type=int,   default=None,
@@ -90,6 +92,8 @@ def main():
     cfg_te.beta_pred_action_loss = float(args.beta_pred_action_loss)
     cfg_te.rollout_steps = int(args.rollout_steps)
     cfg_te.rollout_loss_weight = float(args.rollout_loss_weight)
+    if args.reward_time_offset_penalty is not None:
+        cfg_te.reward_time_offset_penalty = float(args.reward_time_offset_penalty)
     cfg_te.train_use_history_augmentation = not bool(args.disable_history_augmentation)
     cfg_te.train_aug_flip_prob = float(args.train_aug_flip_prob)
     cfg_te.train_aug_dropout_prob = float(args.train_aug_dropout_prob)
@@ -142,6 +146,7 @@ def main():
         "beta_pred_action_loss": cfg_te.beta_pred_action_loss,
         "rollout_steps": cfg_te.rollout_steps,
         "rollout_loss_weight": cfg_te.rollout_loss_weight,
+        "reward_time_offset_penalty": cfg_te.reward_time_offset_penalty,
         "train_use_history_augmentation": cfg_te.train_use_history_augmentation,
         "train_aug_flip_prob": cfg_te.train_aug_flip_prob,
         "train_aug_dropout_prob": cfg_te.train_aug_dropout_prob,
