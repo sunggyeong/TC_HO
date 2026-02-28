@@ -1129,10 +1129,19 @@ def build_learned_realtime_corrected_plan(
                     _pending_node = -1
                     _pending_exec_t = -1
                     if 0 <= pn < N and A_actual[t, pn] == 1:
+                        # 예약 노드가 실행 시점에 가용 → 그대로 실행
                         proposed = pn
                         dbg_model_proposed += 1
                         dbg_pending_executed += 1
-                    # else: 예약 노드가 실행 시점에 불가 → proposed = current_node 유지
+                    else:
+                        # 예약 노드 불가 → 실행 시점의 최우선 가용 노드로 대체 실행
+                        avail_now = np.where(A_actual[t] == 1)[0]
+                        if len(avail_now) > 0:
+                            best = int(avail_now[np.argmax(U_actual[t, avail_now] * reliability[avail_now])])
+                            if best != current_node:
+                                proposed = best
+                                dbg_model_proposed += 1
+                                dbg_pending_executed += 1
             else:
                 k = int(getattr(cfg_te, "rt_switch_time_offset_max", 1))
                 proposed = current_node

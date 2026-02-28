@@ -2,7 +2,7 @@
   "scenario": "normal",
   "preset": "balanced",
   "epochs": 3,
-  "max_sats": 16,
+  "max_sats": 100,
   "train_seeds": [
     0
   ],
@@ -23,7 +23,7 @@
   ],
   "L": 20,
   "H": 30,
-  "stride": 5,
+  "stride": 10,
   "lr": 0.001,
   "reward_learnable": false,
   "alpha_oracle_loss": 0.3,
@@ -40,11 +40,11 @@
     "w_jitter": 0.35
   },
   "rt_guardrails": {
-    "dwell": 1,
-    "hysteresis": 0.02,
+    "dwell": 3,
+    "hysteresis": 0.1,
     "pingpong_window": 5,
-    "pingpong_extra": 0.04
+    "pingpong_extra": 0.15
   },
   "rt_enable_pending": true,
-  "elapsed_sec": 191.6590347290039
+  "elapsed_sec": 383.7236638069153
 }
