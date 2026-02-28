@@ -91,8 +91,8 @@ class TrainEvalRealtimeConfig:
 
     # 학습 중 보상 가중치 학습 여부 (True면 w_utility, w_outage 등이 nn.Parameter로 최적화)
     reward_learnable: bool = False
-    alpha_oracle_loss: float = 0.5
-    beta_pred_action_loss: float = 1.5
+    alpha_oracle_loss: float = 0.3
+    beta_pred_action_loss: float = 1.0
     rollout_steps: int = 8
     rollout_loss_weight: float = 1.0
     train_use_history_augmentation: bool = True
@@ -157,6 +157,38 @@ def update_ema_target(online_net, target_net, tau=0.05):
     with torch.no_grad():
         for online_param, target_param in zip(online_net.parameters(), target_net.parameters()):
             target_param.data.copy_(tau * online_param.data + (1.0 - tau) * target_param.data)
+
+
+def _build_consistency_condition(
+    future_pred_flat: torch.Tensor,   # (1, H*N_model)  availability forecast (already flattened)
+    future_U: np.ndarray,             # (H, N_env) utility forecast — padded to N_model inside
+    current_node: int,
+    prev_node: int,
+    N_model: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """
+    Builds the enriched condition vector for OnlineConsistencyGenerator.
+
+    Layout: [avail_flat | utility_flat | cur_node_one_hot | prev_node_one_hot]
+            (1, 2*H*N_model + 2*N_model)
+    """
+    H_u = future_U.shape[0]
+    N_u = future_U.shape[1]
+    if N_u < N_model:
+        pad = np.zeros((H_u, N_model - N_u), dtype=np.float32)
+        future_U = np.concatenate([future_U, pad], axis=1)
+    U_flat = torch.tensor(future_U.flatten(), dtype=torch.float32, device=device).unsqueeze(0)  # (1, H*N_model)
+
+    cur_oh = torch.zeros(1, N_model, device=device)
+    if 0 <= current_node < N_model:
+        cur_oh[0, current_node] = 1.0
+
+    prev_oh = torch.zeros(1, N_model, device=device)
+    if 0 <= prev_node < N_model:
+        prev_oh[0, prev_node] = 1.0
+
+    return torch.cat([future_pred_flat, U_flat, cur_oh, prev_oh], dim=-1)  # (1, 2*H*N_model + 2*N_model)
 
 
 def save_weights(transformer, consistency, weight_path: str, reward_weights_module=None):
@@ -582,7 +614,13 @@ def _mini_rollout_penalty(transformer, online_consistency, A_in: np.ndarray, A_t
         hist = _augment_history_matrix(sim_hist, SimpleNamespace(phase=getattr(SimpleNamespace(), 'phase', None)), t, cfg_te)
         state_tensor = torch.tensor(hist, dtype=torch.float32, device=device).unsqueeze(0)
         future_pred = transformer(state_tensor)
-        condition = future_pred.view(1, -1).detach()
+        avail_flat = future_pred.view(1, -1).detach()
+        u_slice = U_target[t:t+H, :] if t + H <= U_target.shape[0] else np.pad(
+            U_target[t:, :], ((0, t + H - U_target.shape[0]), (0, 0))
+        )
+        condition = _build_consistency_condition(
+            avail_flat, u_slice, sim_current, sim_prev, A_target.shape[1], device
+        )
         y_noisy = torch.randn(1, 2, device=device)
         y_curr = online_consistency(y_noisy, condition, torch.tensor([[1.0]], device=device))
         total = total + _soft_expected_action_loss(y_curr, A_target[t:t+H, :], U_target[t:t+H, :], sim_current, sim_prev, cfg_te)
@@ -596,17 +634,41 @@ def _mini_rollout_penalty(transformer, online_consistency, A_in: np.ndarray, A_t
     return total / float(K)
 
 
-def evaluate_on_val_seeds(val_pairs: List[Dict[str, Any]], transformer, consistency, cfg_te: TrainEvalRealtimeConfig) -> pd.DataFrame:
+def evaluate_on_val_seeds(
+    val_pairs: List[Dict[str, Any]],
+    transformer,
+    consistency,
+    cfg_te: TrainEvalRealtimeConfig,
+    return_debug: bool = False,
+) -> pd.DataFrame | Tuple[pd.DataFrame, pd.DataFrame]:
     rows = []
+    dbg_rows = []
     for pair in val_pairs:
         seed = pair['seed']
         actual_env = pair['actual_env']
         pred_env = pair['pred_env']
-        rt_plan = build_learned_realtime_corrected_plan(actual_env, pred_env, transformer, consistency, cfg_te, cfg_te.consistency_steps_eval)
+        rt_out = build_learned_realtime_corrected_plan(
+            actual_env,
+            pred_env,
+            transformer,
+            consistency,
+            cfg_te,
+            cfg_te.consistency_steps_eval,
+            return_debug=return_debug,
+        )
+        if return_debug:
+            rt_plan, rt_debug = rt_out
+            rt_debug["seed"] = int(seed)
+            dbg_rows.append(rt_debug)
+        else:
+            rt_plan = rt_out
         _, m_rt = execute_plan_on_env(actual_env, rt_plan, 'Learned_TC_RTCorrected', 'consistency', cfg_te.consistency_steps_eval, cfg_te.exp_cfg)
         m_rt['seed'] = seed
         rows.append(m_rt)
-    return pd.DataFrame(rows)
+    df_val = pd.DataFrame(rows)
+    if return_debug:
+        return df_val, pd.DataFrame(dbg_rows)
+    return df_val
 
 # =========================================================
 # Training (predicted history -> actual future target)
@@ -662,17 +724,20 @@ def train_on_seed_pool(
                 future_A_true = A_target[t:t+H, :]
                 state_tensor = torch.tensor(history_A, dtype=torch.float32, device=device).unsqueeze(0)
                 future_tensor_true = torch.tensor(future_A_true, dtype=torch.float32, device=device).unsqueeze(0)
+                current_node_approx = _best_available_node(A_target[t - 1], U_target[t - 1]) if t - 1 >= 0 else -1
+                prev_node_approx = _best_available_node(A_target[t - 2], U_target[t - 2]) if t - 2 >= 0 else -1
+
                 optimizer.zero_grad()
                 future_pred = transformer(state_tensor)
                 loss_tf = bce_loss_fn(future_pred, future_tensor_true)
 
-                condition = future_pred.view(1, -1).detach()
+                avail_flat = future_pred.view(1, -1).detach()
+                condition = _build_consistency_condition(
+                    avail_flat, U_target[t:t+H, :], current_node_approx, prev_node_approx, N, device
+                )
                 y_noisy_t2 = torch.randn(1, 2, device=device)
                 y_noisy_t1 = y_noisy_t2 * 0.5
                 y_curr = online_consistency(y_noisy_t1, condition, torch.tensor([[1.0]], device=device))
-
-                current_node_approx = _best_available_node(A_target[t - 1], U_target[t - 1]) if t - 1 >= 0 else -1
-                prev_node_approx = _best_available_node(A_target[t - 2], U_target[t - 2]) if t - 2 >= 0 else -1
 
                 if reward_weights_module is not None:
                     w_u, w_o, w_s, w_r, w_j, w_p = reward_weights_module.to_numpy_weights()
@@ -731,7 +796,13 @@ def train_on_seed_pool(
         if val_pairs:
             transformer.eval(); online_consistency.eval()
             with torch.no_grad():
-                df_val = evaluate_on_val_seeds(val_pairs, transformer, online_consistency, cfg_te)
+                df_val, df_dbg = evaluate_on_val_seeds(
+                    val_pairs,
+                    transformer,
+                    online_consistency,
+                    cfg_te,
+                    return_debug=True,
+                )
             if len(df_val) > 0:
                 val_avail = float(df_val['Availability'].mean())
                 val_qoe = float(df_val['EffectiveQoE'].mean())
@@ -739,7 +810,33 @@ def train_on_seed_pool(
                 val_hof = float(df_val['HO_Failure_Ratio'].mean())
                 val_score = val_avail + 0.3 * val_qoe - 0.5 * val_pp - 0.5 * val_hof
                 row['val_score'] = val_score
-                print(f"[val] epoch {epoch+1:02d}/{cfg_te.epochs} | score={val_score:.4f} | Avail={val_avail:.4f} | QoE={val_qoe:.4f} | PP={val_pp:.4f} | HOF={val_hof:.4f}")
+                if len(df_dbg) > 0:
+                    row["val_rt_acceptance_rate"] = float(df_dbg["rt_acceptance_rate"].mean())
+                    row["val_rt_fallback_rate"] = float(df_dbg["rt_fallback_rate"].mean())
+                    row["val_rt_guardrail_block_rate"] = float(df_dbg["rt_guardrail_block_rate"].mean())
+                    row["val_rt_model_proposed"] = float(df_dbg["rt_model_proposed"].mean())
+                    row["val_rt_model_applied"] = float(df_dbg["rt_model_applied"].mean())
+                    row["val_rt_fallback_used"] = float(df_dbg["rt_fallback_used"].mean())
+                    row["val_rt_guardrail_block"] = float(df_dbg["rt_guardrail_block"].mean())
+                else:
+                    row["val_rt_acceptance_rate"] = float("nan")
+                    row["val_rt_fallback_rate"] = float("nan")
+                    row["val_rt_guardrail_block_rate"] = float("nan")
+                    row["val_rt_model_proposed"] = float("nan")
+                    row["val_rt_model_applied"] = float("nan")
+                    row["val_rt_fallback_used"] = float("nan")
+                    row["val_rt_guardrail_block"] = float("nan")
+
+                print(
+                    f"[val] epoch {epoch+1:02d}/{cfg_te.epochs} | "
+                    f"score={val_score:.4f} | "
+                    f"Avail={val_avail:.4f} | QoE={val_qoe:.4f} | "
+                    f"PP={val_pp:.4f} | HOF={val_hof:.4f} | "
+                    f"accept={row['val_rt_acceptance_rate']:.3f} | "
+                    f"fallback={row['val_rt_fallback_rate']:.3f} | "
+                    f"block={row['val_rt_guardrail_block_rate']:.3f}",
+                    flush=True,
+                )
                 if val_score > best_val_score:
                     best_val_score = val_score
                     save_weights(transformer, online_consistency, cfg_te.weight_path, reward_weights_module)
@@ -769,20 +866,29 @@ def _predict_target_from_history(
     N: int,
     device: torch.device,
     consistency_steps: int = 2,
+    U_slice: np.ndarray | None = None,   # (H, N_env) utility forecast; padded internally if needed
+    current_node: int = -1,
+    prev_node: int = -1,
 ) -> Tuple[int, int]:
     """
-    history_A: (L, N) binary matrix
-    return: (target_time_offset, target_node_idx)
+    history_A: (L, N) binary matrix (already padded to model N if needed)
+    U_slice:   (H, N_env) utility — padded to model N inside _build_consistency_condition
+    return:    (target_time_offset, target_node_idx)
     """
     state_tensor = torch.tensor(history_A, dtype=torch.float32, device=device).unsqueeze(0)
 
+    if U_slice is None:
+        U_slice = np.zeros((H, N), dtype=np.float32)
+
     with torch.no_grad():
-        future_pred = transformer(state_tensor)
-        condition = future_pred.view(1, -1)
+        future_pred = transformer(state_tensor)          # (1, H, N)
+        avail_flat = future_pred.view(1, -1)             # (1, H*N)
+        condition = _build_consistency_condition(
+            avail_flat, U_slice, current_node, prev_node, N, device
+        )
 
         y_curr = torch.randn(1, 2, device=device)
 
-        # configurable few-step consistency
         steps = max(1, int(consistency_steps))
         for s in range(steps, 0, -1):
             step_tensor = torch.tensor([[float(s)]], dtype=torch.float32, device=device)
@@ -840,9 +946,14 @@ def build_learned_offline_plan_from_pred_env(
             planned_idx[t] = current_node
             continue
 
+        prev_node = int(planned_idx[t - 1]) if t - 1 >= 0 else -1
         history_A = A_pred[t - L : t, :]  # (L, N_env)
         if N_env < N_model:
             history_A = np.pad(history_A, ((0, 0), (0, N_model - N_env)), mode="constant", constant_values=0)
+        t_end = min(t + H, T)
+        u_slice = U_pred[t:t_end, :]
+        if u_slice.shape[0] < H:
+            u_slice = np.pad(u_slice, ((0, H - u_slice.shape[0]), (0, 0)))
         target_time_offset, target_node_idx = _predict_target_from_history(
             transformer=transformer,
             consistency=consistency,
@@ -851,6 +962,9 @@ def build_learned_offline_plan_from_pred_env(
             N=N_model,
             device=device,
             consistency_steps=consistency_steps,
+            U_slice=u_slice,
+            current_node=current_node,
+            prev_node=prev_node,
         )
         target_node_idx = min(max(target_node_idx, 0), N_env - 1)
 
@@ -896,7 +1010,8 @@ def build_learned_realtime_corrected_plan(
     consistency,
     cfg_te: TrainEvalRealtimeConfig,
     consistency_steps: int,
-) -> np.ndarray:
+    return_debug: bool = False,
+) -> np.ndarray | Tuple[np.ndarray, Dict[str, Any]]:
     """
     실시간 보정 버전 (receding-horizon, MPC 스타일):
     - 모델은 기본적으로 predicted history를 사용
@@ -972,6 +1087,10 @@ def build_learned_realtime_corrected_plan(
             history_A = A_obs_corrected[t - L : t, :]  # (L, N)
             if N < N_model:
                 history_A = np.pad(history_A, ((0, 0), (0, N_model - N)), mode="constant", constant_values=0)
+            t_end = min(t + H, T)
+            u_slice_rt = U_pred[t:t_end, :]
+            if u_slice_rt.shape[0] < H:
+                u_slice_rt = np.pad(u_slice_rt, ((0, H - u_slice_rt.shape[0]), (0, 0)))
             target_time_offset, target_node_idx = _predict_target_from_history(
                 transformer=transformer,
                 consistency=consistency,
@@ -980,6 +1099,9 @@ def build_learned_realtime_corrected_plan(
                 N=N_model,
                 device=device,
                 consistency_steps=consistency_steps,
+                U_slice=u_slice_rt,
+                current_node=current_node,
+                prev_node=prev1,
             )
             target_node_idx = min(max(target_node_idx, 0), N - 1)
 
@@ -1120,6 +1242,21 @@ def build_learned_realtime_corrected_plan(
         print(f"  guardrail_blocked_switches = {dbg_guardrail_block}")
         print(f"  model_applied_ratio        = {dbg_model_applied / float(total_effective):.4f}")
 
+    debug_stats = {
+        "rt_total_slots": int(dbg_total_slots),
+        "rt_model_proposed": int(dbg_model_proposed),
+        "rt_model_proposed_valid": int(dbg_model_proposed_valid),
+        "rt_model_applied": int(dbg_model_applied),
+        "rt_fallback_used": int(dbg_fallback_used),
+        "rt_guardrail_block": int(dbg_guardrail_block),
+    }
+    den = max(1, int(dbg_model_proposed))
+    debug_stats["rt_acceptance_rate"] = float(dbg_model_applied) / float(den)
+    debug_stats["rt_fallback_rate"] = float(dbg_fallback_used) / float(den)
+    debug_stats["rt_guardrail_block_rate"] = float(dbg_guardrail_block) / float(den)
+
+    if return_debug:
+        return planned_idx, debug_stats
     return planned_idx
 
 

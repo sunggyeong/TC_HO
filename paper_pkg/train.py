@@ -2,10 +2,9 @@
 # -*- coding: utf-8 -*-
 """paper_pkg.train
 
-Robust offline->online training runner.
-- uses val actual execution to choose the best checkpoint
-- keeps offline learning as prior learning, not final policy learning
-- supports lightweight domain randomization on predicted history
+Clean training runner.
+- preset controls penalties + RT guardrails
+- epochs can be small for debugging
 """
 from __future__ import annotations
 import argparse, json, time
@@ -16,36 +15,45 @@ from .scenarios import apply_scenario
 from .presets import PRESETS
 from . import tc_train_eval as tc
 
-
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--scenario", choices=["normal", "paper_stress"], default="paper_stress")
-    ap.add_argument("--preset", choices=["stable", "balanced", "aggressive"], default="balanced")
+    ap.add_argument("--scenario", choices=["normal","paper_stress"], default="paper_stress")
+    ap.add_argument("--preset", choices=["stable","balanced","aggressive"], default="balanced")
     ap.add_argument("--results_dir", default="results_paper")
-    ap.add_argument("--epochs", type=int, default=30)
-    ap.add_argument("--max_sats", type=int, default=None)
-    ap.add_argument("--train_seeds", nargs="+", type=int, default=None)
-    ap.add_argument("--val_seeds", nargs="+", type=int, default=None)
-    ap.add_argument("--test_seeds", nargs="+", type=int, default=None)
+    ap.add_argument("--epochs", type=int, default=30, help="paper: 30")
+    ap.add_argument("--max_sats", type=int, default=None, help="override cfg.max_sats")
+    ap.add_argument("--train_seeds", nargs="+", type=int, default=None,
+                    help="paper: 0..14 (15). If not set, [0]")
+    ap.add_argument("--val_seeds", nargs="+", type=int, default=None,
+                    help="paper: 15..19 (5). If not set, [1]")
+    ap.add_argument("--test_seeds", nargs="+", type=int, default=None,
+                    help="paper eval: 20..29 (10). Stored in manifest only; use eval --seeds for runs")
     ap.add_argument("--L", type=int, default=20)
     ap.add_argument("--H", type=int, default=30)
     ap.add_argument("--stride", type=int, default=5)
     ap.add_argument("--lr", type=float, default=1e-3)
-    ap.add_argument("--reward_learnable", action="store_true")
-    ap.add_argument("--alpha_oracle_loss", type=float, default=1.0)
-    ap.add_argument("--beta_pred_action_loss", type=float, default=0.25)
+    ap.add_argument("--reward_learnable", action="store_true", help="learn reward penalty weights during training")
+
+    # --- loss 비중 ---
+    ap.add_argument("--alpha_oracle_loss",       type=float, default=0.3,
+                    help="oracle point-regression loss weight (default 0.3)")
+    ap.add_argument("--beta_pred_action_loss",   type=float, default=1.0,
+                    help="expected-reward / soft-action loss weight (default 1.0)")
+    ap.add_argument("--rollout_steps",           type=int,   default=8)
+    ap.add_argument("--rollout_loss_weight",     type=float, default=1.0)
+
+    # --- history augmentation ---
     ap.add_argument("--disable_history_augmentation", action="store_true")
-    ap.add_argument("--train_aug_flip_prob", type=float, default=0.02)
-    ap.add_argument("--train_aug_dropout_prob", type=float, default=0.03)
-    ap.add_argument("--train_aug_phase_extra", type=float, default=0.06)
+    ap.add_argument("--train_aug_flip_prob",    type=float, default=0.02)
+    ap.add_argument("--train_aug_dropout_prob", type=float, default=0.06)
+    ap.add_argument("--train_aug_phase_extra",  type=float, default=0.1)
+
     args = ap.parse_args()
 
     preset = PRESETS[args.preset]
-    outdir = Path(args.results_dir)
-    outdir.mkdir(parents=True, exist_ok=True)
+    outdir = Path(args.results_dir); outdir.mkdir(parents=True, exist_ok=True)
 
-    exp_cfg = ExperimentConfig()
-    exp_cfg.results_dir = str(outdir)
+    exp_cfg = ExperimentConfig(); exp_cfg.results_dir = str(outdir)
     apply_scenario(exp_cfg, args.scenario)
     if args.max_sats is not None:
         exp_cfg.max_sats = int(args.max_sats)
@@ -55,42 +63,36 @@ def main():
     cfg_te.results_dir = str(outdir)
     cfg_te.weight_path = str(outdir / f"weights_tc_{args.scenario}.pth")
 
+    # 논문용 기본: 학습 15, 검증 5, 평가 10 (eval 시 --seeds 20 21 ... 29)
     cfg_te.train_seeds = list(args.train_seeds) if args.train_seeds is not None else list(range(15))
     cfg_te.val_seeds = list(args.val_seeds) if args.val_seeds is not None else list(range(15, 20))
     cfg_te.test_seeds = list(args.test_seeds) if args.test_seeds is not None else list(range(20, 30))
-    cfg_te.L = int(args.L)
-    cfg_te.H = int(args.H)
-    cfg_te.stride = int(args.stride)
-    cfg_te.lr = float(args.lr)
-    cfg_te.epochs = int(args.epochs)
+    cfg_te.L = int(args.L); cfg_te.H = int(args.H); cfg_te.stride = int(args.stride)
+    cfg_te.lr = float(args.lr); cfg_te.epochs = int(args.epochs)
 
     cfg_te.reward_w_switch = float(preset["w_switch"])
     cfg_te.reward_w_pingpong = float(preset["w_pingpong"])
     cfg_te.reward_w_jitter = float(preset["w_jitter"])
-    cfg_te.reward_learnable = bool(args.reward_learnable)
+    cfg_te.reward_learnable = getattr(args, "reward_learnable", False)
+    cfg_te.alpha_oracle_loss = float(args.alpha_oracle_loss)
+    cfg_te.beta_pred_action_loss = float(args.beta_pred_action_loss)
+    cfg_te.rollout_steps = int(args.rollout_steps)
+    cfg_te.rollout_loss_weight = float(args.rollout_loss_weight)
+    cfg_te.train_use_history_augmentation = not bool(args.disable_history_augmentation)
+    cfg_te.train_aug_flip_prob = float(args.train_aug_flip_prob)
+    cfg_te.train_aug_dropout_prob = float(args.train_aug_dropout_prob)
+    cfg_te.train_aug_phase_extra = float(args.train_aug_phase_extra)
 
     cfg_te.rt_enable_guardrails = True
     cfg_te.rt_min_dwell = int(preset["rt_dwell"])
     cfg_te.rt_hysteresis_ratio = float(preset["rt_hysteresis"])
     cfg_te.rt_pingpong_window = int(preset["rt_pingpong_window"])
     cfg_te.rt_pingpong_extra_hysteresis_ratio = float(preset["rt_pingpong_extra"])
+
+    # Enable pending + lookahead fallback by default
     cfg_te.rt_enable_pending = True
     cfg_te.rt_fallback_mode = "lookahead"
     cfg_te.rt_debug_log = False
-
-    # new hybrid-training knobs
-    cfg_te.alpha_oracle_loss = float(args.alpha_oracle_loss)
-    cfg_te.beta_pred_action_loss = float(args.beta_pred_action_loss)
-    cfg_te.train_use_history_augmentation = not bool(args.disable_history_augmentation)
-    cfg_te.train_aug_flip_prob = float(args.train_aug_flip_prob)
-    cfg_te.train_aug_dropout_prob = float(args.train_aug_dropout_prob)
-    cfg_te.train_aug_phase_extra = float(args.train_aug_phase_extra)
-
-    # validation score weights
-    cfg_te.val_w_avail = 1.0
-    cfg_te.val_w_qoe = 0.3
-    cfg_te.val_w_pp = 0.5
-    cfg_te.val_w_hof = 0.5
 
     t0 = time.time()
     train_pairs = tc.collect_env_pairs(exp_cfg, cfg_te.train_seeds)
@@ -103,6 +105,8 @@ def main():
     else:
         raise TypeError("train_on_seed_pool returned unexpected type")
 
+    # 가중치 저장은 train_on_seed_pool 내부에서 수행 (reward_learnable 시 reward_weights 포함)
+
     manifest = {
         "scenario": args.scenario,
         "preset": args.preset,
@@ -111,40 +115,28 @@ def main():
         "train_seeds": cfg_te.train_seeds,
         "val_seeds": cfg_te.val_seeds,
         "test_seeds": cfg_te.test_seeds,
-        "L": cfg_te.L,
-        "H": cfg_te.H,
-        "stride": cfg_te.stride,
-        "lr": cfg_te.lr,
+        "L": cfg_te.L, "H": cfg_te.H, "stride": cfg_te.stride, "lr": cfg_te.lr,
         "reward_learnable": cfg_te.reward_learnable,
         "alpha_oracle_loss": cfg_te.alpha_oracle_loss,
         "beta_pred_action_loss": cfg_te.beta_pred_action_loss,
-        "history_augmentation": {
-            "enabled": cfg_te.train_use_history_augmentation,
-            "flip_prob": cfg_te.train_aug_flip_prob,
-            "dropout_prob": cfg_te.train_aug_dropout_prob,
-            "phase_extra": cfg_te.train_aug_phase_extra,
-        },
-        "penalties": {
-            "w_switch": cfg_te.reward_w_switch,
-            "w_pingpong": cfg_te.reward_w_pingpong,
-            "w_jitter": cfg_te.reward_w_jitter,
-        },
-        "rt_guardrails": {
-            "dwell": cfg_te.rt_min_dwell,
-            "hysteresis": cfg_te.rt_hysteresis_ratio,
-            "pingpong_window": cfg_te.rt_pingpong_window,
-            "pingpong_extra": cfg_te.rt_pingpong_extra_hysteresis_ratio,
-        },
+        "rollout_steps": cfg_te.rollout_steps,
+        "rollout_loss_weight": cfg_te.rollout_loss_weight,
+        "train_use_history_augmentation": cfg_te.train_use_history_augmentation,
+        "train_aug_flip_prob": cfg_te.train_aug_flip_prob,
+        "train_aug_dropout_prob": cfg_te.train_aug_dropout_prob,
+        "train_aug_phase_extra": cfg_te.train_aug_phase_extra,
+        "penalties": {"w_switch": cfg_te.reward_w_switch, "w_pingpong": cfg_te.reward_w_pingpong, "w_jitter": cfg_te.reward_w_jitter},
+        "rt_guardrails": {"dwell": cfg_te.rt_min_dwell, "hysteresis": cfg_te.rt_hysteresis_ratio,
+                          "pingpong_window": cfg_te.rt_pingpong_window, "pingpong_extra": cfg_te.rt_pingpong_extra_hysteresis_ratio},
         "elapsed_sec": time.time() - t0,
     }
     (outdir / f"train_manifest_{args.scenario}.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     if hist is not None and hasattr(hist, "to_csv"):
         hist.to_csv(outdir / f"train_history_{args.scenario}.csv", index=False)
 
-    print(f"[OK] saved weights: {cfg_te.weight_path}")
-    print(f"[OK] manifest: {outdir / f'train_manifest_{args.scenario}.json'}")
+    print(f"✅ saved weights: {cfg_te.weight_path}")
+    print(f"✅ manifest: {outdir / f'train_manifest_{args.scenario}.json'}")
     print(f"Elapsed: {manifest['elapsed_sec']:.2f}s")
-
 
 if __name__ == "__main__":
     main()

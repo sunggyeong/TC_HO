@@ -46,17 +46,20 @@ class OnlineConsistencyGenerator(nn.Module):
         super().__init__()
         self.H = H
         self.num_nodes = num_nodes
-        condition_dim = H * num_nodes
-        
+        # condition = avail_forecast(H*N) + utility_forecast(H*N) + cur_node_oh(N) + prev_node_oh(N)
+        condition_dim = 2 * H * num_nodes + 2 * num_nodes
+
         self.step_mlp = nn.Sequential(
             nn.Linear(1, embed_dim), nn.ReLU(), nn.Linear(embed_dim, embed_dim)
         )
-        
+
         self.net = nn.Sequential(
-            nn.Linear(2 + condition_dim + embed_dim, 128),
+            nn.Linear(2 + condition_dim + embed_dim, 256),
             nn.ReLU(),
-            nn.Linear(128, 2),
-            nn.Sigmoid() # [시간_비율(0~1), 노드_비율(0~1)]
+            nn.Linear(256, 64),
+            nn.ReLU(),
+            nn.Linear(64, 2),
+            nn.Sigmoid()  # [time_ratio(0~1), node_ratio(0~1)]
         )
 
     def forward(self, y_noisy, condition, step):
@@ -98,18 +101,37 @@ class ProposedTCPlanner:
         self.transformer.eval()
         self.consistency.eval()
 
+    def _build_condition(self, future_pred, utility_slice: np.ndarray, current_node: int, prev_node: int, N: int):
+        """future_pred: (1, H, N_model) tensor; utility_slice: (H, N_env) array"""
+        import torch
+        N_model = self.num_nodes
+        avail_flat = future_pred.view(1, -1)  # (1, H*N_model)
+        # pad utility to N_model if needed
+        H_actual = utility_slice.shape[0]
+        if utility_slice.shape[1] < N_model:
+            pad_u = np.zeros((H_actual, N_model - utility_slice.shape[1]), dtype=np.float32)
+            utility_slice = np.concatenate([utility_slice, pad_u], axis=1)
+        U_flat = torch.tensor(utility_slice.flatten(), dtype=torch.float32, device=self.device).unsqueeze(0)
+        cur_oh = torch.zeros(1, N_model, device=self.device)
+        if 0 <= current_node < N_model:
+            cur_oh[0, current_node] = 1.0
+        prev_oh = torch.zeros(1, N_model, device=self.device)
+        if 0 <= prev_node < N_model:
+            prev_oh[0, prev_node] = 1.0
+        return torch.cat([avail_flat, U_flat, cur_oh, prev_oh], dim=-1)
+
     def plan(self, env_result, consistency_steps: int = 2) -> np.ndarray:
         T, N = env_result.A_final.shape
         if self.transformer is None:
             self._init_models(N)
-            
+
         planned_idx = np.full(T, -1, dtype=int)
         current_node = -1
+        prev_node = -1
         last_switch_t = -10**9
-        
+
         for t in range(T):
             if t < self.L:
-                # 버퍼가 차기 전에는 휴리스틱하게 utility가 가장 높은 노드 선택
                 available = np.where(env_result.A_final[t] == 1)[0]
                 if len(available) > 0:
                     current_node = available[np.argmax(env_result.utility[t, available])]
@@ -117,15 +139,21 @@ class ProposedTCPlanner:
                     current_node = -1
                 planned_idx[t] = current_node
                 continue
-                
+
+            prev_node = int(planned_idx[t - 1]) if t - 1 >= 0 else -1
             history_A = env_result.A_final[t - self.L : t, :]
             state_tensor = torch.tensor(history_A, dtype=torch.float32).unsqueeze(0).to(self.device)
-            
+            H_eff = self.H
+            t_end = min(t + H_eff, T)
+            u_slice = np.asarray(env_result.utility[t:t_end, :], dtype=np.float32)
+            if u_slice.shape[0] < H_eff:
+                u_slice = np.pad(u_slice, ((0, H_eff - u_slice.shape[0]), (0, 0)))
+
             # Make-Before-Break 추론
             with torch.no_grad():
-                future_pred = self.transformer(state_tensor) 
-                condition = future_pred.view(1, -1)
-                
+                future_pred = self.transformer(state_tensor)
+                condition = self._build_condition(future_pred, u_slice, current_node, prev_node, N)
+
                 y_curr = torch.randn(1, 2).to(self.device)
                 steps = max(1, int(consistency_steps))
                 for s_val in range(steps, 0, -1):
