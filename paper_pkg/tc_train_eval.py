@@ -62,7 +62,7 @@ class TrainEvalRealtimeConfig:
     L: int = 20
     H: int = 30
     epochs: int = 3
-    stride: int = 5
+    stride: int = 10
     lr: float = 5e-4
     lambda_consistency: float = 1.0
     reward_invalid_penalty: float = -1.0
@@ -93,8 +93,8 @@ class TrainEvalRealtimeConfig:
     reward_learnable: bool = False
     alpha_oracle_loss: float = 0.3
     beta_pred_action_loss: float = 1.0
-    rollout_steps: int = 8
-    rollout_loss_weight: float = 1.0
+    rollout_steps: int = 1
+    rollout_loss_weight: float = 0.0
     train_use_history_augmentation: bool = True
     train_aug_flip_prob: float = 0.02
     train_aug_dropout_prob: float = 0.06
@@ -1048,6 +1048,11 @@ def build_learned_realtime_corrected_plan(
     # 마지막 스위치 시각(슬롯 인덱스)
     last_switch_t = -10**9
 
+    # ---- Pending Scheduler 상태 ----
+    # 모델이 offset=d, node=n을 예측하면 t+d에 n으로 스위치를 예약하고 중간 슬롯마다 재검증
+    _pending_node: int = -1        # 예약된 타겟 노드 (-1 = 없음)
+    _pending_exec_t: int = -1      # 실행 예약 슬롯 (-1 = 없음)
+
     # 디버그 카운터 (online TC 동작 분석용)
     dbg_total_slots = T
     dbg_model_proposed = 0              # 모델이 target_time_offset==0으로 switch 제안한 슬롯 수
@@ -1055,6 +1060,9 @@ def build_learned_realtime_corrected_plan(
     dbg_model_applied = 0               # 최종 플랜에서 모델 제안이 그대로 반영된 슬롯 수
     dbg_fallback_used = 0              # actual-slot greedy fallback이 사용된 슬롯 수
     dbg_guardrail_block = 0            # guardrail 때문에 switch가 막힌 횟수
+    dbg_pending_set = 0                # pending 설정/갱신 횟수
+    dbg_pending_executed = 0           # 예약 시각 도래 후 실행 성공 횟수
+    dbg_pending_early_fallback = 0     # 현재 연결 실패 시 pending 노드 조기 실행 횟수
 
     def _score(t_: int, n_: int) -> float:
         # utility * reliability (둘 다 0~대략 1 scale 기대)
@@ -1105,11 +1113,32 @@ def build_learned_realtime_corrected_plan(
             )
             target_node_idx = min(max(target_node_idx, 0), N - 1)
 
-            k = int(getattr(cfg_te, "rt_switch_time_offset_max", 1))
-            proposed = current_node
-            if target_time_offset <= k:
-                dbg_model_proposed += 1
-                proposed = int(target_node_idx)
+            # ---- (A-2) Pending Scheduler / 즉시 제안 결정 ----
+            if cfg_te.rt_enable_pending:
+                new_exec_t = t + target_time_offset
+                # 재예측마다 pending 갱신: 더 이른(또는 동일) 도착 예정이면 교체
+                if _pending_exec_t == -1 or new_exec_t <= _pending_exec_t:
+                    _pending_node = int(target_node_idx)
+                    _pending_exec_t = new_exec_t
+                    dbg_pending_set += 1
+
+                # 예약 슬롯 도래 여부 확인
+                proposed = current_node
+                if _pending_exec_t != -1 and t >= _pending_exec_t:
+                    pn = int(_pending_node)
+                    _pending_node = -1
+                    _pending_exec_t = -1
+                    if 0 <= pn < N and A_actual[t, pn] == 1:
+                        proposed = pn
+                        dbg_model_proposed += 1
+                        dbg_pending_executed += 1
+                    # else: 예약 노드가 실행 시점에 불가 → proposed = current_node 유지
+            else:
+                k = int(getattr(cfg_te, "rt_switch_time_offset_max", 1))
+                proposed = current_node
+                if target_time_offset <= k:
+                    dbg_model_proposed += 1
+                    proposed = int(target_node_idx)
 
             # 실시간 보정 로직
             proposed_valid_now = (
@@ -1127,16 +1156,24 @@ def build_learned_realtime_corrected_plan(
                 low_rel = (float(reliability[proposed]) < cfg_te.rt_low_reliability_threshold)
 
             corrected = current_node
-
-            # (변경) 모델이 현재 슬롯에서 유효한 노드를 제안하면 신뢰도와 무관하게 일단 수용
-            # (guardrail에서 추가 필터링)
             model_based_switch = False
             if proposed_valid_now:
                 corrected = proposed
                 model_based_switch = True
             else:
-                # proposed가 지금 안되거나 (가용 X) 하면 fallback
-                if cfg_te.rt_use_actual_current_slot_fallback:
+                # pending 조기 실행: 현재 연결이 실제로 끊겼을 때만 pending 노드를 당겨 실행
+                if (cfg_te.rt_enable_pending
+                        and _pending_exec_t != -1
+                        and current_node != -1
+                        and A_actual[t, current_node] == 0
+                        and 0 <= _pending_node < N
+                        and A_actual[t, _pending_node] == 1):
+                    corrected = int(_pending_node)
+                    model_based_switch = True
+                    _pending_node = -1
+                    _pending_exec_t = -1
+                    dbg_pending_early_fallback += 1
+                elif cfg_te.rt_use_actual_current_slot_fallback:
                     avail = np.where(A_actual[t] == 1)[0]
                     if len(avail) > 0:
                         # 신뢰도 반영 + 현재 actual utility 기반 즉시 보정
@@ -1241,6 +1278,9 @@ def build_learned_realtime_corrected_plan(
         print(f"  fallback_used_switches     = {dbg_fallback_used}")
         print(f"  guardrail_blocked_switches = {dbg_guardrail_block}")
         print(f"  model_applied_ratio        = {dbg_model_applied / float(total_effective):.4f}")
+        print(f"  pending_set                = {dbg_pending_set}")
+        print(f"  pending_executed           = {dbg_pending_executed}")
+        print(f"  pending_early_fallback     = {dbg_pending_early_fallback}")
 
     debug_stats = {
         "rt_total_slots": int(dbg_total_slots),
@@ -1249,11 +1289,17 @@ def build_learned_realtime_corrected_plan(
         "rt_model_applied": int(dbg_model_applied),
         "rt_fallback_used": int(dbg_fallback_used),
         "rt_guardrail_block": int(dbg_guardrail_block),
+        "rt_pending_set": int(dbg_pending_set),
+        "rt_pending_executed": int(dbg_pending_executed),
+        "rt_pending_early_fallback": int(dbg_pending_early_fallback),
     }
     den = max(1, int(dbg_model_proposed))
     debug_stats["rt_acceptance_rate"] = float(dbg_model_applied) / float(den)
     debug_stats["rt_fallback_rate"] = float(dbg_fallback_used) / float(den)
     debug_stats["rt_guardrail_block_rate"] = float(dbg_guardrail_block) / float(den)
+    dbg_pending_total = max(1, int(dbg_pending_set))
+    debug_stats["rt_pending_execute_rate"] = float(dbg_pending_executed) / float(dbg_pending_total)
+    debug_stats["rt_pending_early_fallback_rate"] = float(dbg_pending_early_fallback) / float(dbg_pending_total)
 
     if return_debug:
         return planned_idx, debug_stats

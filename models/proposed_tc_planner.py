@@ -72,7 +72,9 @@ class OnlineConsistencyGenerator(nn.Module):
 # 3. Proposed TC Planner (실험 연동용 메인 인터페이스)
 # =====================================================================
 class ProposedTCPlanner:
-    def __init__(self, L=20, H=30, device='cpu', weight_path='trained_weights_rl.pth', switch_time_offset_max=1, min_dwell=3, hysteresis_ratio=0.08):
+    def __init__(self, L=20, H=30, device='cpu', weight_path='trained_weights_rl.pth',
+                 switch_time_offset_max=1, min_dwell=3, hysteresis_ratio=0.08,
+                 enable_pending=True):
         self.L = L
         self.H = H
         self.device = device
@@ -80,6 +82,7 @@ class ProposedTCPlanner:
         self.switch_time_offset_max = switch_time_offset_max
         self.min_dwell = min_dwell
         self.hysteresis_ratio = hysteresis_ratio
+        self.enable_pending = enable_pending
         self.num_nodes = None
         self.transformer = None
         self.consistency = None
@@ -130,6 +133,10 @@ class ProposedTCPlanner:
         prev_node = -1
         last_switch_t = -10**9
 
+        # Pending scheduler 상태
+        _pending_node: int = -1
+        _pending_exec_t: int = -1
+
         for t in range(T):
             if t < self.L:
                 available = np.where(env_result.A_final[t] == 1)[0]
@@ -165,14 +172,47 @@ class ProposedTCPlanner:
                 
                 target_time_offset = min(max(target_time_offset, 0), self.H - 1)
                 target_node_idx = min(max(target_node_idx, 0), N - 1)
-                
-                # proposal/prior + lightweight guardrail
-                can_switch = target_time_offset <= self.switch_time_offset_max and env_result.A_final[t, target_node_idx] == 1
-                if can_switch and (t - last_switch_t) >= self.min_dwell:
+
+            # ---- Pending Scheduler ----
+            if self.enable_pending:
+                new_exec_t = t + target_time_offset
+                # 재예측마다 갱신: 더 이른(또는 동일) 예약이면 교체
+                if _pending_exec_t == -1 or new_exec_t <= _pending_exec_t:
+                    _pending_node = int(target_node_idx)
+                    _pending_exec_t = new_exec_t
+
+                # 예약 슬롯 도래 시 실행 시도
+                candidate_node = current_node
+                if _pending_exec_t != -1 and t >= _pending_exec_t:
+                    pn = int(_pending_node)
+                    _pending_node = -1
+                    _pending_exec_t = -1
+                    if 0 <= pn < N and env_result.A_final[t, pn] == 1:
+                        candidate_node = pn
+                # elif: 아직 대기 중 → candidate_node = current_node 유지
+            else:
+                candidate_node = current_node
+                if target_time_offset <= self.switch_time_offset_max and env_result.A_final[t, target_node_idx] == 1:
+                    candidate_node = int(target_node_idx)
+
+            # 현재 연결 실패 & pending 가용 시 조기 실행
+            if (self.enable_pending
+                    and _pending_exec_t != -1
+                    and current_node != -1
+                    and env_result.A_final[t, current_node] == 0
+                    and 0 <= _pending_node < N
+                    and env_result.A_final[t, _pending_node] == 1):
+                candidate_node = int(_pending_node)
+                _pending_node = -1
+                _pending_exec_t = -1
+
+            # Lightweight guardrail (dwell + hysteresis)
+            if candidate_node != current_node and candidate_node != -1 and env_result.A_final[t, candidate_node] == 1:
+                if (t - last_switch_t) >= self.min_dwell:
                     cur_score = float(env_result.utility[t, current_node]) if current_node != -1 and env_result.A_final[t, current_node] == 1 else -1e9
-                    new_score = float(env_result.utility[t, target_node_idx])
+                    new_score = float(env_result.utility[t, candidate_node])
                     if current_node == -1 or new_score >= cur_score * (1.0 + self.hysteresis_ratio):
-                        current_node = target_node_idx
+                        current_node = candidate_node
                         last_switch_t = t
             
             # 현재 접속 중인 노드가 커버리지를 벗어나면 fallback 선택
