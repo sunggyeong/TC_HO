@@ -69,11 +69,14 @@ class OnlineConsistencyGenerator(nn.Module):
 # 3. Proposed TC Planner (실험 연동용 메인 인터페이스)
 # =====================================================================
 class ProposedTCPlanner:
-    def __init__(self, L=20, H=30, device='cpu', weight_path='trained_weights_rl.pth'):
+    def __init__(self, L=20, H=30, device='cpu', weight_path='trained_weights_rl.pth', switch_time_offset_max=1, min_dwell=3, hysteresis_ratio=0.08):
         self.L = L
         self.H = H
         self.device = device
         self.weight_path = weight_path
+        self.switch_time_offset_max = switch_time_offset_max
+        self.min_dwell = min_dwell
+        self.hysteresis_ratio = hysteresis_ratio
         self.num_nodes = None
         self.transformer = None
         self.consistency = None
@@ -102,6 +105,7 @@ class ProposedTCPlanner:
             
         planned_idx = np.full(T, -1, dtype=int)
         current_node = -1
+        last_switch_t = -10**9
         
         for t in range(T):
             if t < self.L:
@@ -134,13 +138,22 @@ class ProposedTCPlanner:
                 target_time_offset = min(max(target_time_offset, 0), self.H - 1)
                 target_node_idx = min(max(target_node_idx, 0), N - 1)
                 
-                # 예측된 핸드오버 타이밍이 도래했고, 타겟 네트워크가 가용 상태라면 핸드오버
-                if target_time_offset == 0 and env_result.A_final[t, target_node_idx] == 1:
-                    current_node = target_node_idx
+                # proposal/prior + lightweight guardrail
+                can_switch = target_time_offset <= self.switch_time_offset_max and env_result.A_final[t, target_node_idx] == 1
+                if can_switch and (t - last_switch_t) >= self.min_dwell:
+                    cur_score = float(env_result.utility[t, current_node]) if current_node != -1 and env_result.A_final[t, current_node] == 1 else -1e9
+                    new_score = float(env_result.utility[t, target_node_idx])
+                    if current_node == -1 or new_score >= cur_score * (1.0 + self.hysteresis_ratio):
+                        current_node = target_node_idx
+                        last_switch_t = t
             
-            # 현재 접속 중인 노드가 커버리지를 벗어나면 끊김 처리
+            # 현재 접속 중인 노드가 커버리지를 벗어나면 fallback 선택
             if current_node != -1 and env_result.A_final[t, current_node] == 0:
-                current_node = -1 
+                available = np.where(env_result.A_final[t] == 1)[0]
+                if len(available) > 0:
+                    current_node = int(available[np.argmax(env_result.utility[t, available])])
+                else:
+                    current_node = -1
                 
             planned_idx[t] = current_node
             

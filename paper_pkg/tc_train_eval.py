@@ -91,6 +91,14 @@ class TrainEvalRealtimeConfig:
 
     # 학습 중 보상 가중치 학습 여부 (True면 w_utility, w_outage 등이 nn.Parameter로 최적화)
     reward_learnable: bool = False
+    alpha_oracle_loss: float = 0.60
+    beta_pred_action_loss: float = 0.40
+    rollout_steps: int = 4
+    rollout_loss_weight: float = 0.35
+    train_use_history_augmentation: bool = True
+    train_aug_flip_prob: float = 0.02
+    train_aug_dropout_prob: float = 0.05
+    train_aug_phase_extra: float = 0.05
 
     # 평가 시 consistency sampling steps
     consistency_steps_eval: int = 2
@@ -496,6 +504,110 @@ def _reward_to_supervision_weight(reward_val: float, cfg_te: TrainEvalRealtimeCo
     return w
 
 
+
+
+def _reward_for_action(
+    future_A_true: np.ndarray,
+    future_U_true: np.ndarray,
+    action_i: int,
+    action_n: int,
+    current_node: int,
+    prev_node: int,
+    cfg_te: TrainEvalRealtimeConfig,
+) -> float:
+    return _discounted_integrated_reward_single_aircraft(
+        future_A_true=future_A_true,
+        future_U_true=future_U_true,
+        target_time_offset=action_i,
+        target_node_idx=action_n,
+        current_node=current_node,
+        cfg_te=cfg_te,
+        prev_node=prev_node,
+    )
+
+
+def _augment_history_matrix(history_A: np.ndarray, actual_env, t: int, cfg_te: TrainEvalRealtimeConfig) -> np.ndarray:
+    aug = np.array(history_A, copy=True)
+    if not getattr(cfg_te, "train_use_history_augmentation", True):
+        return aug
+    flip_prob = float(getattr(cfg_te, "train_aug_flip_prob", 0.02))
+    drop_prob = float(getattr(cfg_te, "train_aug_dropout_prob", 0.05))
+    extra = float(getattr(cfg_te, "train_aug_phase_extra", 0.05))
+    ph = getattr(actual_env, "phase", None)
+    if ph is not None and t > 0:
+        window = ph[max(0, t - len(history_A)):t]
+        if len(window) >= 2 and np.any(window[1:] != window[:-1]):
+            flip_prob += extra
+            drop_prob += extra
+    if drop_prob > 0:
+        mask = (np.random.rand(*aug.shape) < drop_prob)
+        aug[mask] = 0.0
+    if flip_prob > 0:
+        mask = (np.random.rand(*aug.shape) < flip_prob)
+        aug[mask] = 1.0 - aug[mask]
+    return aug
+
+
+def _soft_expected_action_loss(y_curr: torch.Tensor, future_A_true: np.ndarray, future_U_true: np.ndarray,
+                               current_node: int, prev_node: int, cfg_te: TrainEvalRealtimeConfig) -> torch.Tensor:
+    H = future_A_true.shape[0]
+    N = future_A_true.shape[1]
+    logits_t = -((torch.arange(H, device=y_curr.device, dtype=torch.float32) / max(1, H - 1)) - y_curr[0, 0]) ** 2 * 24.0
+    logits_n = -((torch.arange(N, device=y_curr.device, dtype=torch.float32) / max(1, N - 1)) - y_curr[0, 1]) ** 2 * 24.0
+    pt = torch.softmax(logits_t, dim=0)
+    pn = torch.softmax(logits_n, dim=0)
+    rewards = torch.zeros((H, N), dtype=torch.float32, device=y_curr.device)
+    for i in range(H):
+        for n in range(N):
+            rewards[i, n] = _reward_for_action(future_A_true, future_U_true, i, n, current_node, prev_node, cfg_te)
+    expected_reward = (pt[:, None] * pn[None, :] * rewards).sum()
+    return -expected_reward
+
+
+def _mini_rollout_penalty(transformer, online_consistency, A_in: np.ndarray, A_target: np.ndarray, U_target: np.ndarray,
+                          t_start: int, current_node: int, prev_node: int, cfg_te: TrainEvalRealtimeConfig, device: torch.device) -> torch.Tensor:
+    L, H = cfg_te.L, cfg_te.H
+    K = max(1, int(getattr(cfg_te, 'rollout_steps', 4)))
+    total = torch.tensor(0.0, device=device)
+    sim_current = int(current_node)
+    sim_prev = int(prev_node)
+    sim_hist = np.array(A_in[max(0, t_start - L):t_start, :], copy=True)
+    if sim_hist.shape[0] < L:
+        pad = np.zeros((L - sim_hist.shape[0], A_in.shape[1]), dtype=np.float32)
+        sim_hist = np.vstack([pad, sim_hist])
+    for offs in range(K):
+        t = t_start + offs
+        if t >= A_target.shape[0] - H:
+            break
+        hist = _augment_history_matrix(sim_hist, SimpleNamespace(phase=getattr(SimpleNamespace(), 'phase', None)), t, cfg_te)
+        state_tensor = torch.tensor(hist, dtype=torch.float32, device=device).unsqueeze(0)
+        future_pred = transformer(state_tensor)
+        condition = future_pred.view(1, -1).detach()
+        y_noisy = torch.randn(1, 2, device=device)
+        y_curr = online_consistency(y_noisy, condition, torch.tensor([[1.0]], device=device))
+        total = total + _soft_expected_action_loss(y_curr, A_target[t:t+H, :], U_target[t:t+H, :], sim_current, sim_prev, cfg_te)
+        pred_i = int(torch.clamp((y_curr[0, 0] * (H - 1)).round(), 0, H - 1).item())
+        pred_n = int(torch.clamp((y_curr[0, 1] * (A_target.shape[1] - 1)).round(), 0, A_target.shape[1] - 1).item())
+        if pred_i <= int(getattr(cfg_te, 'rt_switch_time_offset_max', 1)) and A_target[t, pred_n] == 1:
+            sim_prev, sim_current = sim_current, pred_n
+        if sim_current != -1 and A_target[t, sim_current] == 0:
+            sim_prev, sim_current = sim_current, -1
+        sim_hist = np.vstack([sim_hist[1:], A_in[t:t+1, :]])
+    return total / float(K)
+
+
+def evaluate_on_val_seeds(val_pairs: List[Dict[str, Any]], transformer, consistency, cfg_te: TrainEvalRealtimeConfig) -> pd.DataFrame:
+    rows = []
+    for pair in val_pairs:
+        seed = pair['seed']
+        actual_env = pair['actual_env']
+        pred_env = pair['pred_env']
+        rt_plan = build_learned_realtime_corrected_plan(actual_env, pred_env, transformer, consistency, cfg_te, cfg_te.consistency_steps_eval)
+        _, m_rt = execute_plan_on_env(actual_env, rt_plan, 'Learned_TC_RTCorrected', 'consistency', cfg_te.consistency_steps_eval, cfg_te.exp_cfg)
+        m_rt['seed'] = seed
+        rows.append(m_rt)
+    return pd.DataFrame(rows)
+
 # =========================================================
 # Training (predicted history -> actual future target)
 # =========================================================
@@ -503,200 +615,145 @@ def _reward_to_supervision_weight(reward_val: float, cfg_te: TrainEvalRealtimeCo
 def train_on_seed_pool(
     env_pairs: List[Dict[str, Any]],
     cfg_te: TrainEvalRealtimeConfig,
+    val_pairs: List[Dict[str, Any]] | None = None,
 ):
     device = get_device()
-    print(f"🚀 training start | device={device}")
-
-    # num_nodes 고정
+    print(f"[train] start | device={device}")
     first = env_pairs[0]
     _, N = first["actual_env"].A_final.shape
-
     L, H = cfg_te.L, cfg_te.H
     transformer = OnlineTransformerPredictor(num_nodes=N, L=L, H=H).to(device)
     online_consistency = OnlineConsistencyGenerator(num_nodes=N, H=H).to(device)
-
     target_consistency = copy.deepcopy(online_consistency).to(device)
     target_consistency.eval()
     for p in target_consistency.parameters():
         p.requires_grad = False
-
     reward_weights_module = None
     if getattr(cfg_te, "reward_learnable", False):
         reward_weights_module = LearnableRewardWeights(cfg_te, device)
-        optimizer = optim.Adam(
-            list(transformer.parameters())
-            + list(online_consistency.parameters())
-            + list(reward_weights_module.parameters()),
-            lr=cfg_te.lr,
-        )
-        print("[train] reward weights are learnable (optimized with policy)")
+        optimizer = optim.Adam(list(transformer.parameters()) + list(online_consistency.parameters()) + list(reward_weights_module.parameters()), lr=cfg_te.lr)
     else:
-        optimizer = optim.Adam(
-            list(transformer.parameters()) + list(online_consistency.parameters()),
-            lr=cfg_te.lr,
-        )
+        optimizer = optim.Adam(list(transformer.parameters()) + list(online_consistency.parameters()), lr=cfg_te.lr)
     bce_loss_fn = nn.BCELoss()
-
     history_rows = []
     t0 = time.time()
+    best_val_score = -float("inf")
 
     for epoch in range(cfg_te.epochs):
-        transformer.train()
-        online_consistency.train()
-
-        epoch_loss = 0.0
-        epoch_loss_tf = 0.0
-        epoch_loss_rl = 0.0
-        epoch_loss_cs = 0.0
+        transformer.train(); online_consistency.train()
+        epoch_loss = epoch_loss_tf = epoch_loss_rl = epoch_loss_cs = 0.0
         epoch_reward = 0.0
+        epoch_pred_reward = 0.0
         step_count = 0
 
         for pair in env_pairs:
-            actual_env = pair["actual_env"]
-            pred_env = pair["pred_env"]
-
-            A_in = np.asarray(pred_env.A_final, dtype=np.float32)        # 입력 = predicted
-            A_target = np.asarray(actual_env.A_final, dtype=np.float32)  # 타깃 = actual
-            U_target = np.asarray(actual_env.utility, dtype=np.float32)  # 보상 = actual utility
-
+            actual_env = pair['actual_env']
+            pred_env = pair['pred_env']
+            A_in = np.asarray(pred_env.A_final, dtype=np.float32)
+            A_target = np.asarray(actual_env.A_final, dtype=np.float32)
+            U_target = np.asarray(actual_env.utility, dtype=np.float32)
             T, N2 = A_in.shape
             if N2 != N:
-                raise ValueError(f"num_nodes mismatch in training: expected {N}, got {N2}")
+                raise ValueError(f'num_nodes mismatch in training: expected {N}, got {N2}')
 
-            # 슬라이딩 윈도우
             for t in range(L, T - H, cfg_te.stride):
-                history_A = A_in[t - L : t, :]
-                future_A_true = A_target[t : t + H, :]
-
+                history_A = A_in[t-L:t, :]
+                history_A = _augment_history_matrix(history_A, actual_env, t, cfg_te)
+                future_A_true = A_target[t:t+H, :]
                 state_tensor = torch.tensor(history_A, dtype=torch.float32, device=device).unsqueeze(0)
                 future_tensor_true = torch.tensor(future_A_true, dtype=torch.float32, device=device).unsqueeze(0)
-
                 optimizer.zero_grad()
-
-                # 1) Transformer: predicted history -> actual future coverage
                 future_pred = transformer(state_tensor)
                 loss_tf = bce_loss_fn(future_pred, future_tensor_true)
 
-                # 2) Consistency action generation (continuous target: [time_ratio, node_ratio])
                 condition = future_pred.view(1, -1).detach()
                 y_noisy_t2 = torch.randn(1, 2, device=device)
                 y_noisy_t1 = y_noisy_t2 * 0.5
+                y_curr = online_consistency(y_noisy_t1, condition, torch.tensor([[1.0]], device=device))
 
-                step_2 = torch.tensor([[2.0]], device=device)
-                step_1 = torch.tensor([[1.0]], device=device)
-
-                y_curr = online_consistency(y_noisy_t1, condition, step_1)
-
-                # 3) Reward-guided target (mini integrated reward, single-aircraft)
-                if t - 1 >= 0:
-                    current_node_approx = _best_available_node(A_target[t - 1], U_target[t - 1])
-                else:
-                    current_node_approx = -1
-                if t - 2 >= 0:
-                    prev_node_approx = _best_available_node(A_target[t - 2], U_target[t - 2])
-                else:
-                    prev_node_approx = -1
-
-                gamma = float(cfg_te.reward_gamma)
-                jitter_thr = float(getattr(cfg_te, "reward_jitter_min_hold_ratio", 0.35))
-                use_discounted = bool(getattr(cfg_te, "reward_use_discounted_return", True))
-                invalid_penalty = float(cfg_te.reward_invalid_penalty)
-
-                time_offset_penalty = float(getattr(cfg_te, "reward_time_offset_penalty", 0.0))
-                tie_breaker_eps = float(getattr(cfg_te, "reward_tie_breaker_epsilon", 1e-6))
+                current_node_approx = _best_available_node(A_target[t - 1], U_target[t - 1]) if t - 1 >= 0 else -1
+                prev_node_approx = _best_available_node(A_target[t - 2], U_target[t - 2]) if t - 2 >= 0 else -1
 
                 if reward_weights_module is not None:
                     w_u, w_o, w_s, w_r, w_j, w_p = reward_weights_module.to_numpy_weights()
                     best_i, best_n, reward_val = _find_best_reward_guided_target_with_weights(
-                        future_A_true, U_target[t : t + H, :],
-                        current_node_approx, prev_node_approx,
+                        future_A_true, U_target[t:t+H, :], current_node_approx, prev_node_approx,
                         w_u, w_o, w_s, w_r, w_j, w_p,
-                        gamma, jitter_thr, use_discounted, invalid_penalty,
-                        time_offset_penalty=time_offset_penalty,
-                        tie_breaker_epsilon=tie_breaker_eps,
+                        float(cfg_te.reward_gamma), float(getattr(cfg_te, 'reward_jitter_min_hold_ratio', 0.35)),
+                        bool(getattr(cfg_te, 'reward_use_discounted_return', True)), float(cfg_te.reward_invalid_penalty),
+                        time_offset_penalty=float(getattr(cfg_te, 'reward_time_offset_penalty', 0.0)),
+                        tie_breaker_epsilon=float(getattr(cfg_te, 'reward_tie_breaker_epsilon', 1e-6)),
                     )
-                    coefs = _reward_coefficients_for_action(
-                        future_A_true, U_target[t : t + H, :],
-                        best_i, best_n, current_node_approx, prev_node_approx,
-                        gamma, jitter_thr, use_discounted,
-                    )
+                    coefs = _reward_coefficients_for_action(future_A_true, U_target[t:t+H, :], best_i, best_n, current_node_approx, prev_node_approx, float(cfg_te.reward_gamma), float(getattr(cfg_te, 'reward_jitter_min_hold_ratio', 0.35)), bool(getattr(cfg_te, 'reward_use_discounted_return', True)))
                     coef_tensor = torch.tensor(coefs, dtype=torch.float32, device=device)
-                    reward_torch = (coef_tensor * reward_weights_module()).sum() - (time_offset_penalty * best_i)
+                    reward_torch = (coef_tensor * reward_weights_module()).sum() - (float(getattr(cfg_te, 'reward_time_offset_penalty', 0.0)) * best_i)
                     rl_weight_torch = 1.0 + cfg_te.reward_guided_target_scale * torch.tanh(reward_torch / 2.0)
-                    rl_weight_torch = torch.clamp(
-                        rl_weight_torch,
-                        cfg_te.reward_guided_target_min_weight,
-                        cfg_te.reward_guided_target_max_weight,
-                    )
+                    rl_weight_torch = torch.clamp(rl_weight_torch, cfg_te.reward_guided_target_min_weight, cfg_te.reward_guided_target_max_weight)
                     reward_val = float(reward_torch.detach().item())
                 else:
-                    best_i, best_n, reward_val = _find_best_reward_guided_target(
-                        future_A_true=future_A_true,
-                        future_U_true=U_target[t : t + H, :],
-                        current_node=current_node_approx,
-                        cfg_te=cfg_te,
-                        prev_node=prev_node_approx,
-                    )
+                    best_i, best_n, reward_val = _find_best_reward_guided_target(future_A_true, U_target[t:t+H, :], current_node_approx, cfg_te, prev_node_approx)
                     rl_weight_torch = _reward_to_supervision_weight(reward_val, cfg_te)
 
-                epoch_reward += reward_val
+                epoch_reward += float(reward_val)
+                y_star = torch.tensor([[0.0 if H <= 1 else best_i / float(H - 1), 0.0 if N <= 1 else best_n / float(N - 1)]], dtype=torch.float32, device=device)
+                loss_oracle = rl_weight_torch * F.mse_loss(y_curr, y_star)
+                loss_pred = _soft_expected_action_loss(y_curr, future_A_true, U_target[t:t+H, :], current_node_approx, prev_node_approx, cfg_te)
+                loss_rollout = _mini_rollout_penalty(transformer, online_consistency, A_in, A_target, U_target, t, current_node_approx, prev_node_approx, cfg_te, device)
+                loss_rl = float(getattr(cfg_te, 'alpha_oracle_loss', 0.6)) * loss_oracle + float(getattr(cfg_te, 'beta_pred_action_loss', 0.4)) * loss_pred + float(getattr(cfg_te, 'rollout_loss_weight', 0.35)) * loss_rollout
 
-                y_star = torch.tensor(
-                    [[
-                        0.0 if H <= 1 else (best_i / float(H - 1)),
-                        0.0 if N <= 1 else (best_n / float(N - 1)),
-                    ]],
-                    dtype=torch.float32,
-                    device=device,
-                )
-                loss_rl = rl_weight_torch * F.mse_loss(y_curr, y_star)
+                pred_i = int(torch.clamp((y_curr[0, 0] * (H - 1)).round(), 0, H - 1).item())
+                pred_n = int(torch.clamp((y_curr[0, 1] * (N - 1)).round(), 0, N - 1).item())
+                epoch_pred_reward += _reward_for_action(future_A_true, U_target[t:t+H, :], pred_i, pred_n, current_node_approx, prev_node_approx, cfg_te)
 
-                # 4) Consistency self-consistency loss (EMA target)
                 with torch.no_grad():
-                    y_target = target_consistency(y_noisy_t2, condition, step_2)
+                    y_target = target_consistency(y_noisy_t2, condition, torch.tensor([[2.0]], device=device))
                 loss_cs = F.mse_loss(y_curr, y_target)
-
                 total_loss = loss_tf + loss_rl + (cfg_te.lambda_consistency * loss_cs)
                 total_loss.backward()
+                torch.nn.utils.clip_grad_norm_(list(transformer.parameters()) + list(online_consistency.parameters()), 1.0)
                 optimizer.step()
                 update_ema_target(online_consistency, target_consistency)
-
-                epoch_loss += float(total_loss.item())
-                epoch_loss_tf += float(loss_tf.item())
-                epoch_loss_rl += float(loss_rl.item())
-                epoch_loss_cs += float(loss_cs.item())
-                step_count += 1
+                epoch_loss += float(total_loss.item()); epoch_loss_tf += float(loss_tf.item()); epoch_loss_rl += float(loss_rl.item()); epoch_loss_cs += float(loss_cs.item()); step_count += 1
 
         row = {
-            "epoch": epoch + 1,
-            "steps": step_count,
-            "avg_total_loss": epoch_loss / max(1, step_count),
-            "avg_tf_loss": epoch_loss_tf / max(1, step_count),
-            "avg_rl_loss": epoch_loss_rl / max(1, step_count),
-            "avg_cs_loss": epoch_loss_cs / max(1, step_count),
-            "avg_reward": epoch_reward / max(1, step_count),
-            "elapsed_sec": time.time() - t0,
+            'epoch': epoch + 1,
+            'steps': step_count,
+            'avg_total_loss': epoch_loss / max(1, step_count),
+            'avg_tf_loss': epoch_loss_tf / max(1, step_count),
+            'avg_rl_loss': epoch_loss_rl / max(1, step_count),
+            'avg_cs_loss': epoch_loss_cs / max(1, step_count),
+            'avg_reward': epoch_reward / max(1, step_count),
+            'avg_pred_reward': epoch_pred_reward / max(1, step_count),
+            'elapsed_sec': time.time() - t0,
         }
+        print(f"[train] epoch {epoch+1:02d}/{cfg_te.epochs} | loss={row['avg_total_loss']:.4f} (tf={row['avg_tf_loss']:.4f}, rl={row['avg_rl_loss']:.4f}, cs={row['avg_cs_loss']:.4f}) | oracle_reward={row['avg_reward']:.4f} | pred_reward={row['avg_pred_reward']:.4f} | elapsed={row['elapsed_sec']:.1f}s")
+
+        if val_pairs:
+            transformer.eval(); online_consistency.eval()
+            with torch.no_grad():
+                df_val = evaluate_on_val_seeds(val_pairs, transformer, online_consistency, cfg_te)
+            if len(df_val) > 0:
+                val_avail = float(df_val['Availability'].mean())
+                val_qoe = float(df_val['EffectiveQoE'].mean())
+                val_pp = float(df_val['PingPong_Ratio'].mean())
+                val_hof = float(df_val['HO_Failure_Ratio'].mean())
+                val_score = val_avail + 0.3 * val_qoe - 0.5 * val_pp - 0.5 * val_hof
+                row['val_score'] = val_score
+                print(f"[val] epoch {epoch+1:02d}/{cfg_te.epochs} | score={val_score:.4f} | Avail={val_avail:.4f} | QoE={val_qoe:.4f} | PP={val_pp:.4f} | HOF={val_hof:.4f}")
+                if val_score > best_val_score:
+                    best_val_score = val_score
+                    save_weights(transformer, online_consistency, cfg_te.weight_path, reward_weights_module)
+                    print(f"[best] saved best checkpoint: {cfg_te.weight_path}")
+            transformer.train(); online_consistency.train()
+
         history_rows.append(row)
-        print(
-            f"[train] epoch {epoch+1:02d}/{cfg_te.epochs} | "
-            f"loss={row['avg_total_loss']:.4f} (tf={row['avg_tf_loss']:.4f}, rl={row['avg_rl_loss']:.4f}, cs={row['avg_cs_loss']:.4f}) | "
-            f"reward={row['avg_reward']:.4f} | elapsed={row['elapsed_sec']:.1f}s"
-        )
 
-    transformer.eval()
-    online_consistency.eval()
-
-    if reward_weights_module is not None:
-        w = reward_weights_module.to_numpy_weights()
-        print(f"[train] learned reward weights: w_utility={w[0]:.4f} w_outage={w[1]:.4f} w_switch={w[2]:.4f} w_robust={w[3]:.4f} w_jitter={w[4]:.4f} w_pingpong={w[5]:.4f}")
-
-    save_weights(transformer, online_consistency, cfg_te.weight_path, reward_weights_module)
-
+    transformer.eval(); online_consistency.eval()
     hist_df = pd.DataFrame(history_rows)
-    hist_df.to_csv(Path(cfg_te.results_dir) / "train_history_real_env.csv", index=False)
-    print(f"✅ train history saved: {Path(cfg_te.results_dir) / 'train_history_real_env.csv'}")
-
+    hist_df.to_csv(Path(cfg_te.results_dir) / 'train_history_real_env.csv', index=False)
+    print(f"[OK] train history saved: {Path(cfg_te.results_dir) / 'train_history_real_env.csv'}")
+    if best_val_score == -float('inf'):
+        save_weights(transformer, online_consistency, cfg_te.weight_path, reward_weights_module)
     return transformer, online_consistency, hist_df
 
 
@@ -748,7 +805,9 @@ def build_learned_offline_plan_from_pred_env(
     consistency_steps: int,
 ) -> np.ndarray:
     """
-    predicted env만 보고 만든 learned plan (offline planning)
+    predicted env만 보고 만든 learned plan (offline planning).
+    Offline output is treated as a proposal/prior, with light guardrails
+    so the plan is less brittle when executed online.
     """
     device = next(transformer.parameters()).device
     A_pred = np.asarray(pred_env.A_final)
@@ -764,6 +823,12 @@ def build_learned_offline_plan_from_pred_env(
     L, H = cfg_te.L, cfg_te.H
     planned_idx = np.full(T, -1, dtype=int)
     current_node = -1
+    last_switch_t = -10**9
+
+    def _score(t_: int, n_: int) -> float:
+        if n_ < 0 or n_ >= N_env or A_pred[t_, n_] != 1:
+            return -1e9
+        return float(U_pred[t_, n_])
 
     for t in range(T):
         if t < L:
@@ -789,14 +854,35 @@ def build_learned_offline_plan_from_pred_env(
         )
         target_node_idx = min(max(target_node_idx, 0), N_env - 1)
 
-        # B안: target_time_offset <= rt_switch_time_offset_max 이면 "지금/곧 스위치"로 해석
+        # target_time_offset <= k means "switch now/soon" instead of strict == 0
         k = int(getattr(cfg_te, "rt_switch_time_offset_max", 1))
+        candidate = current_node
         if (target_time_offset <= k) and A_pred[t, target_node_idx] == 1:
-            current_node = int(target_node_idx)
+            candidate = int(target_node_idx)
 
-        # predicted view에서 이미 끊긴 경우
+        # light dwell + hysteresis even for offline proposal
+        if candidate != current_node and candidate != -1:
+            can_switch = True
+            if (
+                (t - last_switch_t) < int(getattr(cfg_te, "rt_min_dwell", 3))
+                and current_node != -1
+                and A_pred[t, current_node] == 1
+            ):
+                can_switch = False
+            if can_switch and current_node != -1 and A_pred[t, current_node] == 1:
+                s_cur = _score(t, current_node)
+                s_new = _score(t, candidate)
+                ratio = float(getattr(cfg_te, "rt_hysteresis_ratio", 0.08))
+                if not (s_new >= s_cur * (1.0 + ratio)):
+                    can_switch = False
+            if can_switch:
+                current_node = candidate
+                last_switch_t = t
+
+        # if current is dead, fallback to best available predicted node
         if current_node != -1 and A_pred[t, current_node] == 0:
-            current_node = -1
+            avail = np.where(A_pred[t] == 1)[0]
+            current_node = int(avail[np.argmax(U_pred[t, avail])]) if len(avail) > 0 else -1
 
         planned_idx[t] = current_node
 
@@ -1174,7 +1260,7 @@ def main():
     print(f"[collect done] train={len(train_pairs)}, val={len(val_pairs)}, test={len(test_pairs)}")
 
     # 2) train
-    transformer, consistency, train_hist = train_on_seed_pool(train_pairs, cfg_te)
+    transformer, consistency, train_hist = train_on_seed_pool(train_pairs, cfg_te, val_pairs=val_pairs)
 
     # (선택) val quick sanity metrics를 원하면 여기 추가 가능
     # 지금은 바로 test 평가
