@@ -30,7 +30,7 @@ def main():
                     help="paper eval: 20..29 (10). Stored in manifest only; use eval --seeds for runs")
     ap.add_argument("--L", type=int, default=20)
     ap.add_argument("--H", type=int, default=30)
-    ap.add_argument("--stride", type=int, default=5)
+    ap.add_argument("--stride", type=int, default=10)
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--reward_learnable", action="store_true", help="learn reward penalty weights during training")
 
@@ -39,8 +39,20 @@ def main():
                     help="oracle point-regression loss weight (default 0.3)")
     ap.add_argument("--beta_pred_action_loss",   type=float, default=1.0,
                     help="expected-reward / soft-action loss weight (default 1.0)")
-    ap.add_argument("--rollout_steps",           type=int,   default=8)
-    ap.add_argument("--rollout_loss_weight",     type=float, default=1.0)
+    ap.add_argument("--rollout_steps",           type=int,   default=1)
+    ap.add_argument("--rollout_loss_weight",     type=float, default=0.0)
+
+    # --- RT guardrail overrides (preset 값 위에 덮어씀) ---
+    ap.add_argument("--rt_min_dwell",                     type=int,   default=None,
+                    help="override preset rt_dwell (slots)")
+    ap.add_argument("--rt_hysteresis_ratio",              type=float, default=None,
+                    help="override preset rt_hysteresis ratio")
+    ap.add_argument("--rt_pingpong_window",               type=int,   default=None,
+                    help="override preset rt_pingpong_window (slots)")
+    ap.add_argument("--rt_pingpong_extra_hysteresis_ratio", type=float, default=None,
+                    help="override preset rt_pingpong_extra ratio")
+    ap.add_argument("--no_pending",  action="store_true",
+                    help="disable pending scheduler (revert to immediate semantics)")
 
     # --- history augmentation ---
     ap.add_argument("--disable_history_augmentation", action="store_true")
@@ -88,9 +100,18 @@ def main():
     cfg_te.rt_hysteresis_ratio = float(preset["rt_hysteresis"])
     cfg_te.rt_pingpong_window = int(preset["rt_pingpong_window"])
     cfg_te.rt_pingpong_extra_hysteresis_ratio = float(preset["rt_pingpong_extra"])
+    # CLI 오버라이드 (지정된 경우에만 preset 값 위에 덮어씀)
+    if args.rt_min_dwell is not None:
+        cfg_te.rt_min_dwell = int(args.rt_min_dwell)
+    if args.rt_hysteresis_ratio is not None:
+        cfg_te.rt_hysteresis_ratio = float(args.rt_hysteresis_ratio)
+    if args.rt_pingpong_window is not None:
+        cfg_te.rt_pingpong_window = int(args.rt_pingpong_window)
+    if args.rt_pingpong_extra_hysteresis_ratio is not None:
+        cfg_te.rt_pingpong_extra_hysteresis_ratio = float(args.rt_pingpong_extra_hysteresis_ratio)
 
-    # Enable pending + lookahead fallback by default
-    cfg_te.rt_enable_pending = True
+    # Pending scheduler (--no_pending으로 끌 수 있음)
+    cfg_te.rt_enable_pending = not bool(args.no_pending)
     cfg_te.rt_fallback_mode = "lookahead"
     cfg_te.rt_debug_log = False
 
@@ -128,6 +149,7 @@ def main():
         "penalties": {"w_switch": cfg_te.reward_w_switch, "w_pingpong": cfg_te.reward_w_pingpong, "w_jitter": cfg_te.reward_w_jitter},
         "rt_guardrails": {"dwell": cfg_te.rt_min_dwell, "hysteresis": cfg_te.rt_hysteresis_ratio,
                           "pingpong_window": cfg_te.rt_pingpong_window, "pingpong_extra": cfg_te.rt_pingpong_extra_hysteresis_ratio},
+        "rt_enable_pending": cfg_te.rt_enable_pending,
         "elapsed_sec": time.time() - t0,
     }
     (outdir / f"train_manifest_{args.scenario}.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")

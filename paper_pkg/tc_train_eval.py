@@ -115,17 +115,17 @@ class TrainEvalRealtimeConfig:
     rt_enable_guardrails: bool = True
 
     # (1) 최소 유지시간: 최근 스위치 후 rt_min_dwell 슬롯 동안은 스위치 금지(현재 연결이 유효한 경우)
-    rt_min_dwell: int = 3
+    rt_min_dwell: int = 1
 
     # (2) 히스테리시스: 스위치하려면 현재 대비 충분한 이득이 있어야 함
     # - ratio 기준: score_new >= score_cur * (1 + rt_hysteresis_ratio)
     # - abs 기준: (선택) score_new - score_cur >= rt_hysteresis_abs
-    rt_hysteresis_ratio: float = 0.08
+    rt_hysteresis_ratio: float = 0.02
     rt_hysteresis_abs: float = 0.0
 
     # (3) 핑퐁(A->B->A) 억제: 최근 rt_pingpong_window 슬롯 내 되돌림이면 더 큰 히스테리시스 요구
     rt_pingpong_window: int = 4
-    rt_pingpong_extra_hysteresis_ratio: float = 0.12
+    rt_pingpong_extra_hysteresis_ratio: float = 0.04
 
     # ---- Realtime planning enhancements ----
     rt_enable_pending: bool = True

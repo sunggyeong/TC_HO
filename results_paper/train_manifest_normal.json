@@ -28,8 +28,8 @@
   "reward_learnable": false,
   "alpha_oracle_loss": 0.3,
   "beta_pred_action_loss": 1.0,
-  "rollout_steps": 8,
-  "rollout_loss_weight": 1.0,
+  "rollout_steps": 1,
+  "rollout_loss_weight": 0.0,
   "train_use_history_augmentation": true,
   "train_aug_flip_prob": 0.02,
   "train_aug_dropout_prob": 0.06,
@@ -40,10 +40,11 @@
     "w_jitter": 0.35
   },
   "rt_guardrails": {
-    "dwell": 3,
-    "hysteresis": 0.1,
+    "dwell": 1,
+    "hysteresis": 0.02,
     "pingpong_window": 5,
-    "pingpong_extra": 0.15
+    "pingpong_extra": 0.04
   },
-  "elapsed_sec": 592.3297390937805
+  "rt_enable_pending": true,
+  "elapsed_sec": 191.6590347290039
 }
