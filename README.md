@@ -43,12 +43,13 @@ TC_HO/
 │   ├── presets.py       # preset (balanced 등) — 가드레일·베이스라인
 │   ├── baselines.py     # Reactive, Lookahead, ShootingSearch
 │   └── figures.py       # 결과 시각화 (선택)
+├── make_eval_figures.py # 평가 요약 CSV → 논문용 피규어 (바 차트) 생성
 ├── baselines/           # DAG 베이스라인 (sustainable_dag)
 ├── providers/           # 궤적·TLE·phase 등
-├── envs/                 # TN-NTN 환경
-├── data/                 # TLE 파일
-├── results_paper/        # 학습 가중치, manifest, train_history_*.csv
-└── results_eval/         # 평가 결과 (exp_paper_runs.csv, exp_paper_summary.csv)
+├── envs/                # TN-NTN 환경
+├── data/                # TLE 파일
+├── results_paper_*/     # 학습 결과 (weights, manifest, train_history)
+└── results_eval/        # 평가 결과 (exp_paper_runs.csv, exp_paper_summary.csv)
 ```
 
 ---
@@ -64,17 +65,18 @@ TC_HO/
 
 ## 학습
 
-- **논문용 기본**: 학습 시드 15개(0~14), 검증 5개(15~19), 에포크 30, `reward_learnable` 권장.
-- 시드/에포크를 지정하지 않으면 위 논문용 기본값이 적용됩니다.
+- **논문용 기본**: 학습 시드 15개(0~14), 검증 5개(15~19), 테스트 10개(20~29), 에포크 30.
+- `--results_dir`로 실험별 결과 폴더를 분리하면 가중치·히스토리·manifest가 해당 경로에 저장됩니다.
 
-### 논문용 (두 시나리오, max_sats=100)
+### 논문용 (H10, H15 등, max_sats=100, paper_stress)
 
 ```bash
-python -m paper_pkg.train --scenario paper_stress  --max_sats 100
-python -m paper_pkg.train --scenario normal  --max_sats 100
+python -m paper_pkg.train --scenario paper_stress --results_dir results_paper_H10_E30 --max_sats 100 --epochs 30 --train_seeds 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 --val_seeds 15 16 17 18 19 --test_seeds 20 21 22 23 24 25 26 27 28 29 --L 20 --H 10 --rollout_loss_weight 0.3 --val_w_latency 0.12 --val_w_jitter 0.03 --val_w_ho 0.02 --rt_fallback_alpha_latency 0.15 2>&1 | Tee-Object -FilePath results_paper_H10_E30\train_live.log
+
+python -m paper_pkg.train --scenario paper_stress --results_dir results_paper_H15_E30 --max_sats 100 --epochs 30 --train_seeds 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 --val_seeds 15 16 17 18 19 --test_seeds 20 21 22 23 24 25 26 27 28 29 --L 20 --H 15 --rollout_loss_weight 0.3 --val_w_latency 0.12 --val_w_jitter 0.03 --val_w_ho 0.02 --rt_fallback_alpha_latency 0.15 2>&1 | Tee-Object -FilePath results_paper_H15_E30\train_live.log
 ```
 
-저장 위치: `results_paper/weights_tc_paper_stress.pth`, `results_paper/weights_tc_normal.pth`
+저장 위치: `results_paper_H10_E30/weights_tc_paper_stress.pth`, `results_paper_H15_E30/weights_tc_paper_stress.pth`, `results_paper_*/train_history_*.csv`, `results_paper_*/train_manifest_*.json`
 
 ### 디버깅용 (에포크 1, 시드 1개)
 
@@ -82,14 +84,12 @@ python -m paper_pkg.train --scenario normal  --max_sats 100
 python -m paper_pkg.train --scenario paper_stress --reward_learnable --max_sats 100 --epochs 1 --train_seeds 0 --val_seeds 1
 ```
 
-## 실험용
+## 실험용 (간단 설정)
+
 ```bash
-python  -m paper_pkg.train --scenario paper_stress --max_sats 100 --epochs 8 --train_seeds 0 1 2 3 4 --val_seeds 5 6 7 --L 10 --H 5 --rollout_loss_weight 0.3 --val_w_latency 0.12 --val_w_jitter 0.03 --val_w_ho 0.02 --rt_fallback_alpha_latency 0.15
-python  -m paper_pkg.train --scenario normal --max_sats 100 --epochs 8 --train_seeds 0 1 2 3 4 --val_seeds 5 6 7 --L 10 --H 5 --rollout_loss_weight 0.3 --val_w_latency 0.12 --val_w_jitter 0.03 --val_w_ho 0.02 --rt_fallback_alpha_latency 0.15
-
+python -m paper_pkg.train --scenario paper_stress --results_dir results_paper --max_sats 100 --epochs 8 --train_seeds 0 1 2 3 4 --val_seeds 5 6 7 --L 10 --H 5 --rollout_loss_weight 0.3 --val_w_latency 0.12 --val_w_jitter 0.03 --val_w_ho 0.02 --rt_fallback_alpha_latency 0.15
 python -m paper_pkg.eval --scenario paper_stress --max_sats 100 --seeds 20 21 22 23 24 --weights results_paper/weights_tc_paper_stress.pth --results_dir results_eval/paper_stress --rt_debug
-
-python -m paper_pkg.eval --scenario normal --max_sats 100 --seeds 20 21 22 23 24 --weights results_paper/weights_tc_normal.pth --results_dir results_eval/normal --rt_debug
+python -m make_eval_figures --summary_csv results_eval/paper_stress/exp_paper_summary.csv --outdir results_eval/paper_stress/figures --title_prefix "paper_stress"
 ```
 
 ### 주요 옵션
@@ -111,16 +111,34 @@ python -m paper_pkg.eval --scenario normal --max_sats 100 --seeds 20 21 22 23 24
 - TC(Offline / RTCorrected), Oracle/Predicted DAG, Reactive Myopic, Lookahead Greedy, ShootingSearch를 한 번에 실행합니다.
 - 평가 시드는 학습/검증과 겹치지 않게 20~29(10개) 사용을 권장합니다.
 
-### 시나리오별로 결과 폴더 분리
+### 논문용 (H10·H15 등, 평가 결과별 폴더 분리)
+
+```bash
+python -m paper_pkg.eval --scenario paper_stress --results_dir results_paper_H10_E30/eval_debug_H10_E30/test20_29 --weights results_paper_H10_E30/weights_tc_paper_stress.pth --max_sats 100 --seeds 20 21 22 23 24 25 26 27 28 29 --save_timelines --rt_debug 2>&1 | Tee-Object -FilePath results_paper_H10_E30/eval_debug_H10_E30/test20_29/eval_live.log
+
+python -m paper_pkg.eval --scenario paper_stress --results_dir results_paper_H15_E30/eval_debug_H15_E30/test20_29 --weights results_paper_H15_E30/weights_tc_paper_stress.pth --max_sats 100 --seeds 20 21 22 23 24 25 26 27 28 29 --save_timelines --rt_debug 2>&1 | Tee-Object -FilePath results_paper_H15_E30/eval_debug_H15_E30/test20_29/eval_live.log
+```
+
+생성 파일: `results_paper_<H>_E30/eval_debug_<H>_E30/test20_29/exp_paper_runs.csv`, `exp_paper_summary.csv`
+
+### 피규어 생성 (make_eval_figures)
+
+평가 후 `exp_paper_summary.csv`를 이용해 논문용 피규어를 생성합니다. `--summary_csv`와 `--outdir`이 필수입니다.
+
+```bash
+python -m make_eval_figures --summary_csv results_paper_H10_E30/eval_debug_H10_E30/test20_29/exp_paper_summary.csv --outdir results_paper_H10_E30/eval_debug_H10_E30/test20_29/figures --title_prefix "H10 seeds20_29"
+
+python -m make_eval_figures --summary_csv results_paper_H15_E30/eval_debug_H15_E30/test20_29/exp_paper_summary.csv --outdir results_paper_H15_E30/eval_debug_H15_E30/test20_29/figures --title_prefix "H15 seeds20_29"
+```
+
+생성 파일: `--outdir` 아래 per-metric 바 차트 및 zoom 차트.
+
+### 시나리오별 결과 폴더 (예: results_eval 사용 시)
 
 ```bash
 python -m paper_pkg.eval --scenario paper_stress --max_sats 100 --seeds 20 21 22 23 24 25 26 27 28 29 --weights results_paper/weights_tc_paper_stress.pth --results_dir results_eval/paper_stress 
-
 python -m paper_pkg.eval --scenario normal --max_sats 100 --seeds 20 21 22 23 24 25 26 27 28 29 --weights results_paper/weights_tc_normal.pth --results_dir results_eval/normal
 ```
-
-생성 파일:  
-`results_eval/<시나리오>/exp_paper_runs.csv`, `exp_paper_summary.csv`
 
 ## 평가 디버깅 
 
@@ -130,7 +148,15 @@ python -m paper_pkg.eval --scenario paper_stress --max_sats 100 --seeds 20 21 22
 python -m paper_pkg.eval --scenario normal --max_sats 100 --seeds 20 21 22 23 24  --weights results_paper/weights_tc_normal.pth --results_dir results_eval/normal --rt_debug
 ```
 
-### 주요 옵션
+### make_eval_figures 주요 옵션
+
+| 옵션 | 설명 |
+|------|------|
+| `--summary_csv` | exp_paper_summary.csv 경로 (필수) |
+| `--outdir` | 피규어 출력 디렉터리 (필수) |
+| `--title_prefix` | 차트 제목 접두사 (예: "H10 seeds20_29") |
+
+### 평가 주요 옵션
 
 | 옵션 | 설명 | 기본값 |
 |------|------|--------|
@@ -138,7 +164,7 @@ python -m paper_pkg.eval --scenario normal --max_sats 100 --seeds 20 21 22 23 24
 | `--weights` | TC 체크포인트 경로 | None(베이스라인만) |
 | `--max_sats` | 환경 최대 위성 수 | config 기본 |
 | `--seeds` | 평가 시드 리스트 | [8,9,10] |
-| `--results_dir` | CSV 저장 디렉터리 | results_eval |
+| `--results_dir` | CSV·결과 저장 디렉터리 | results_eval |
 
 ---
 
@@ -148,25 +174,43 @@ python -m paper_pkg.eval --scenario normal --max_sats 100 --seeds 20 21 22 23 24
 
 ```python
 # 학습
-!python -m paper_pkg.train --scenario paper_stress --reward_learnable --max_sats 100
-!python -m paper_pkg.train --scenario normal --reward_learnable --max_sats 100
+!python -m paper_pkg.train --scenario paper_stress --results_dir results_paper --reward_learnable --max_sats 100
+!python -m paper_pkg.train --scenario normal --results_dir results_paper --reward_learnable --max_sats 100
 
 # 평가 (시나리오별 폴더에 저장)
 !python -m paper_pkg.eval --scenario paper_stress --max_sats 100 --seeds 20 21 22 23 24 25 26 27 28 29 --weights results_paper/weights_tc_paper_stress.pth --results_dir results_eval/paper_stress
 !python -m paper_pkg.eval --scenario normal --max_sats 100 --seeds 20 21 22 23 24 25 26 27 28 29 --weights results_paper/weights_tc_normal.pth --results_dir results_eval/normal
+
+# 피규어 생성
+!python -m make_eval_figures --summary_csv results_eval/paper_stress/exp_paper_summary.csv --outdir results_eval/paper_stress/figures --title_prefix "paper_stress"
+!python -m make_eval_figures --summary_csv results_eval/normal/exp_paper_summary.csv --outdir results_eval/normal/figures --title_prefix "normal"
 ```
 
 ---
 
 ## 출력 파일 요약
 
+### 학습 (results_dir: 예 `results_paper_H10_E30`)
+
 | 경로 | 내용 |
 |------|------|
-| `results_paper/weights_tc_<scenario>.pth` | 학습된 TC 가중치(transformer, consistency, 선택 시 reward_weights) |
-| `results_paper/train_manifest_<scenario>.json` | 학습 설정·시드·preset 요약 |
-| `results_paper/train_history_real_env.csv` | 에포크별 loss, reward |
-| `results_eval/<scenario>/exp_paper_runs.csv` | 시드·메서드별 런 결과 |
-| `results_eval/<scenario>/exp_paper_summary.csv` | 메서드별 집계(평균 등) |
+| `{results_dir}/weights_tc_<scenario>.pth` | 학습된 TC 가중치(transformer, consistency, 선택 시 reward_weights) |
+| `{results_dir}/train_manifest_<scenario>.json` | 학습 설정·시드·preset 요약 |
+| `{results_dir}/train_history_real_env.csv` | 에포크별 loss, reward |
+
+### 평가 (results_dir: 예 `results_paper_H10_E30/eval_debug_H10_E30/test20_29`)
+
+| 경로 | 내용 |
+|------|------|
+| `{results_dir}/exp_paper_runs.csv` | 시드·메서드별 런 결과 |
+| `{results_dir}/exp_paper_summary.csv` | 메서드별 집계(평균 등) — make_eval_figures 입력용 |
+
+### 피규어 (make_eval_figures --outdir 지정 경로)
+
+| 경로 | 내용 |
+|------|------|
+| `{outdir}/<group>_<metric>.png` | per-metric 바 차트 |
+| `{outdir}/<group>_<metric>_zoom.png` | 온라인 메트릭 zoom 차트 |
 
 CSV가 다른 프로그램(예: Excel)에서 열려 있으면 쓰기 실패 시 `*_new.csv`로 저장되며, 터미널에 경로가 출력됩니다.
 
