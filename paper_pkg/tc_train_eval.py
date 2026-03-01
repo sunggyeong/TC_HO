@@ -82,8 +82,8 @@ class TrainEvalRealtimeConfig:
     reward_guided_target_min_weight: float = 0.1
     reward_guided_target_max_weight: float = 3.0
 
-    # 예측형 정책이 목적이므로 offset 편향 패널티는 기본 OFF
-    reward_time_offset_penalty: float = 0.0
+    # 설계안 B: "일찍 스위치" 유도 — i가 클수록 보상에서 추가 패널티
+    reward_time_offset_penalty: float = 0.0    # predictive planner는 offset 편향을 두지 않음
     reward_tie_breaker_epsilon: float = 1e-6    # 보상 차이 < eps면 같은 것으로 보고 더 작은 i 선호
 
     # 추론: target_time_offset <= k 이면 "지금/곧 스위치"로 해석 (기본 1 = 0 또는 1 슬롯 안)
@@ -141,14 +141,17 @@ class TrainEvalRealtimeConfig:
     rt_enable_mbb: bool = True
     rt_mbb_lookahead: int = 1   # 몇 슬롯 앞까지 볼지 (1=바로 다음 슬롯)
 
-    # ---- val score 가중치 ----
-    val_w_avail: float = 1.0
-    val_w_qoe: float = 0.3
-    val_w_pp: float = 0.5
-    val_w_hof: float = 0.5
-    val_w_latency: float = 0.08   # latency penalty (기준: 50ms)
-    val_w_jitter: float = 0.03    # jitter penalty (기준: 70ms)
-    val_w_ho: float = 0.02        # HO attempt penalty (기준: 300회)
+    # ---- val score 가중치 (명시적 metric 중심) ----
+    # val_score = w_avail*avail + w_lat*lat_term + w_int*int_term + w_jit*jit_term
+    #             - w_pp*pp - w_hof*hof - w_ho*ho_pen
+    # QoE는 로그에만 남기고 best 선택에는 불포함 (중복 반영 방지)
+    val_w_avail: float = 0.50
+    val_w_latency: float = 0.18   # lat_term = clip(1 - lat_ms/100, 0, 1)
+    val_w_interrupt: float = 0.12 # int_term = clip(1 - interrupt_ms/1000, 0, 1)
+    val_w_jitter: float = 0.08    # jit_term = clip(1 - jit_ms/1000, 0, 1)
+    val_w_pp: float = 0.25
+    val_w_hof: float = 0.25
+    val_w_ho: float = 0.05        # ho_pen = ho_count / 300
 
     # ---- BC (imitation) loss ----
     # oracle (best_i, best_n) teacher — 반응형 잔재 없이 예측형 정책 유도용 정규화
@@ -176,33 +179,6 @@ def update_ema_target(online_net, target_net, tau=0.05):
     with torch.no_grad():
         for online_param, target_param in zip(online_net.parameters(), target_net.parameters()):
             target_param.data.copy_(tau * online_param.data + (1.0 - tau) * target_param.data)
-
-
-def _lat_scores(t: int, n_arr: np.ndarray,
-                U: np.ndarray, reliability: np.ndarray,
-                L_arr: "np.ndarray | None", alpha_lat: float) -> np.ndarray:
-    """
-    Latency-aware node scores (vectorized over n_arr):
-        score[k] = U[t, n_arr[k]] * reliability[n_arr[k]] - alpha_lat * (latency_ms[t, n_arr[k]] / 50)
-    L_arr=None → pure reliability-weighted utility (backward-compatible).
-    """
-    scores = (U[t, n_arr] * reliability[n_arr]).astype(np.float64)
-    if L_arr is not None:
-        valid = n_arr < L_arr.shape[1]
-        lat = np.zeros(len(n_arr), dtype=np.float64)
-        lat[valid] = L_arr[t, n_arr[valid]] / 50.0
-        scores -= alpha_lat * lat
-    return scores.astype(np.float32)
-
-
-def _lat_score_scalar(t: int, n: int,
-                      U: np.ndarray, reliability: np.ndarray,
-                      L_arr: "np.ndarray | None", alpha_lat: float) -> float:
-    """Scalar version of _lat_scores for a single node index."""
-    base = float(U[t, n] * reliability[n])
-    if L_arr is not None and n < L_arr.shape[1]:
-        return base - alpha_lat * float(L_arr[t, n]) / 50.0
-    return base
 
 
 def _build_consistency_condition(
@@ -644,165 +620,179 @@ def _soft_expected_action_loss(offset_logits: torch.Tensor, node_logits: torch.T
     return -expected_reward
 
 
-def _mini_rollout_penalty(transformer, online_consistency,
-                          A_in: np.ndarray, A_target: np.ndarray, U_target: np.ndarray,
-                          t_start: int, current_node: int, prev_node: int,
-                          cfg_te: TrainEvalRealtimeConfig, device: torch.device,
-                          L_target: "np.ndarray | None" = None) -> torch.Tensor:
+
+def _mini_rollout_penalty(
+    transformer,
+    online_consistency,
+    A_in: np.ndarray,
+    A_target: np.ndarray,
+    U_target: np.ndarray,
+    t_start: int,
+    current_node: int,
+    prev_node: int,
+    cfg_te: TrainEvalRealtimeConfig,
+    device: torch.device,
+    L_target: np.ndarray | None = None,
+) -> torch.Tensor:
     """
-    RT-corrected plan과 semantics를 맞춘 rollout 시뮬레이터.
-    - pending 예약 → 도래 시 실행 (rt_enable_pending)
-    - latency-aware reliability score (_lat_scores) 로 모든 후보 선택
-    - dwell + hysteresis + ping-pong extra hysteresis guardrail
-    - 현재 연결 실패 시 pending 조기 실행 → 없으면 latency-aware greedy fallback
-    gradient는 y_curr → _soft_expected_action_loss 경로로만 흐름; 상태전이는 numpy/int.
+    Mini rollout that is closer to RT corrected semantics:
+    - pending scheduler
+    - optional make-before-break
+    - reliability-aware fallback
+    - dwell / hysteresis / ping-pong guardrails
     """
     L, H = cfg_te.L, cfg_te.H
-    K = max(1, int(getattr(cfg_te, 'rollout_steps', 4)))
-    N = A_target.shape[1]
-    use_pending   = bool(getattr(cfg_te, 'rt_enable_pending', True))
-    min_dwell     = int(getattr(cfg_te, 'rt_min_dwell', 3))
-    hyst_ratio    = float(getattr(cfg_te, 'rt_hysteresis_ratio', 0.08))
-    pp_window     = int(getattr(cfg_te, 'rt_pingpong_window', 4))
-    pp_extra_hyst = float(getattr(cfg_te, 'rt_pingpong_extra_hysteresis_ratio', 0.04))
-    rel_alpha     = float(getattr(cfg_te, 'rt_reliability_alpha', 0.90))
-    rel_fp_pen    = float(getattr(cfg_te, 'rt_fp_extra_penalty', 0.90))
-    use_mbb       = bool(getattr(cfg_te, 'rt_enable_mbb', True))
-    mbb_k         = int(getattr(cfg_te, 'rt_mbb_lookahead', 1))
-    alpha_lat     = float(cfg_te.rt_fallback_alpha_latency)
-
+    K = max(1, int(getattr(cfg_te, 'rollout_steps', 1)))
     total = torch.tensor(0.0, device=device)
-    sim_current      = int(current_node)
-    sim_prev         = int(prev_node)      # t-1 노드 (ping-pong 감지용)
-    sim_prev2        = -1                  # t-2 노드 (ping-pong 감지용)
-    sim_last_switch  = -10**9
-    sim_pend_node    = -1
-    sim_pend_exec_t  = -1
 
-    # reliability 초기값: 1.0 (RT 플래너와 동일)
-    sim_reliability = np.ones(N, dtype=np.float32)
+    use_pending = bool(getattr(cfg_te, 'rt_enable_pending', True))
+    use_mbb = bool(getattr(cfg_te, 'rt_enable_mbb', True))
+    mbb_k = int(getattr(cfg_te, 'rt_mbb_lookahead', 1))
+    min_dwell = int(getattr(cfg_te, 'rt_min_dwell', 3))
+    hyst_ratio = float(getattr(cfg_te, 'rt_hysteresis_ratio', 0.08))
+    pp_window = int(getattr(cfg_te, 'rt_pingpong_window', 4))
+    pp_extra = float(getattr(cfg_te, 'rt_pingpong_extra_hysteresis_ratio', 0.12))
+    alpha_rel = float(getattr(cfg_te, 'rt_reliability_alpha', 0.90))
+    fp_pen = float(getattr(cfg_te, 'rt_fp_extra_penalty', 0.90))
+    alpha_lat = float(getattr(cfg_te, 'rt_fallback_alpha_latency', 0.05))
 
-    def _rel_score(t_: int, n_: int) -> float:
-        return _lat_score_scalar(t_, n_, U_target, sim_reliability, L_target, alpha_lat)
-
+    sim_current = int(current_node)
+    sim_prev = int(prev_node)
+    sim_last_switch_t = -10**9
+    sim_reliability = np.ones(A_target.shape[1], dtype=np.float32)
     sim_hist = np.array(A_in[max(0, t_start - L):t_start, :], copy=True)
     if sim_hist.shape[0] < L:
-        pad = np.zeros((L - sim_hist.shape[0], N), dtype=np.float32)
+        pad = np.zeros((L - sim_hist.shape[0], A_in.shape[1]), dtype=np.float32)
         sim_hist = np.vstack([pad, sim_hist])
+
+    sim_pend_node = -1
+    sim_pend_exec_t = -1
+    sim_plan_hist: list[int] = []
+
+    def _score_rt(t_: int, n_: int) -> float:
+        if n_ < 0 or n_ >= A_target.shape[1] or A_target[t_, n_] != 1:
+            return -1e9
+        base = float(U_target[t_, n_] * sim_reliability[n_])
+        if L_target is not None and t_ < L_target.shape[0] and n_ < L_target.shape[1]:
+            base -= alpha_lat * (float(L_target[t_, n_]) / 50.0)
+        return base
+
+    def _best_node_rt(t_: int, avail_idx: np.ndarray) -> int:
+        if len(avail_idx) == 0:
+            return -1
+        scores = np.array([_score_rt(t_, int(n)) for n in avail_idx], dtype=np.float32)
+        return int(avail_idx[np.argmax(scores)])
 
     for offs in range(K):
         t = t_start + offs
         if t >= A_target.shape[0] - H:
             break
 
-        hist = _augment_history_matrix(sim_hist, SimpleNamespace(phase=getattr(SimpleNamespace(), 'phase', None)), t, cfg_te)
+        hist = _augment_history_matrix(sim_hist, SimpleNamespace(phase=None), t, cfg_te)
         state_tensor = torch.tensor(hist, dtype=torch.float32, device=device).unsqueeze(0)
         future_pred = transformer(state_tensor)
-        avail_flat  = future_pred.view(1, -1).detach()
+        avail_flat = future_pred.view(1, -1).detach()
         u_slice = U_target[t:t+H, :] if t + H <= U_target.shape[0] else np.pad(
             U_target[t:, :], ((0, t + H - U_target.shape[0]), (0, 0))
         )
-        condition = _build_consistency_condition(avail_flat, u_slice, sim_current, sim_prev, N, device)
+        condition = _build_consistency_condition(
+            avail_flat, u_slice, sim_current, sim_prev, A_target.shape[1], device
+        )
         y_noisy = torch.randn(1, 2, device=device)
         _, offset_logits, node_logits = online_consistency(y_noisy, condition, torch.tensor([[1.0]], device=device))
-        total = total + _soft_expected_action_loss(offset_logits, node_logits, A_target[t:t+H, :], U_target[t:t+H, :], sim_current, sim_prev, cfg_te)
+
+        total = total + _soft_expected_action_loss(
+            offset_logits, node_logits, A_target[t:t+H, :], U_target[t:t+H, :], sim_current, sim_prev, cfg_te
+        )
 
         pred_i = int(offset_logits[0].argmax().item())
         pred_n = int(node_logits[0].argmax().item())
 
-        # ---- 상태 전이: RT-corrected 플래너 semantics ----
+        current_valid_now = (sim_current != -1 and A_target[t, sim_current] == 1)
+        candidate = sim_current
+
         if use_pending:
-            # (1) pending 갱신: 더 이른 예약이면 교체
             new_exec_t = t + pred_i
             if sim_pend_exec_t == -1 or new_exec_t <= sim_pend_exec_t:
-                sim_pend_node   = pred_n
+                sim_pend_node = pred_n
                 sim_pend_exec_t = new_exec_t
 
-            # (2) pending 도래 시 실행 (latency-aware fallback 포함)
-            candidate = sim_current
-            if sim_pend_exec_t != -1 and t >= sim_pend_exec_t:
-                pn = sim_pend_node
-                sim_pend_node   = -1
-                sim_pend_exec_t = -1
-                if 0 <= pn < N and A_target[t, pn] == 1:
-                    candidate = pn
+            if (use_mbb and current_valid_now and sim_pend_exec_t != -1 and 0 <= sim_pend_node < A_target.shape[1]
+                    and A_target[t, sim_pend_node] == 1 and t + 1 < A_target.shape[0]):
+                future_end = min(t + 1 + mbb_k, A_target.shape[0])
+                current_dying = np.any(A_in[t + 1:future_end, sim_current] == 0)
+                if current_dying:
+                    candidate = sim_pend_node
+                    sim_pend_node = -1
+                    sim_pend_exec_t = -1
+
+            if candidate == sim_current and sim_pend_exec_t != -1 and t >= sim_pend_exec_t:
+                if 0 <= sim_pend_node < A_target.shape[1] and A_target[t, sim_pend_node] == 1:
+                    candidate = sim_pend_node
                 else:
                     avail_now = np.where(A_target[t] == 1)[0]
-                    if len(avail_now) > 0:
-                        candidate = int(avail_now[np.argmax(
-                            _lat_scores(t, avail_now, U_target, sim_reliability, L_target, alpha_lat)
-                        )])
-        else:
-            k = int(getattr(cfg_te, 'rt_switch_time_offset_max', 1))
-            candidate = pred_n if (pred_i <= k and 0 <= pred_n < N and A_target[t, pred_n] == 1) else sim_current
-
-        # (2-MBB) Make-Before-Break: pending 대기 중이어도 현재 노드가 곧 끊길 예정이면 조기 실행
-        if (use_pending and use_mbb
-                and candidate == sim_current          # 아직 pending 대기 중
-                and sim_current != -1
-                and 0 <= sim_current < N
-                and A_target[t, sim_current] == 1     # 지금은 살아 있지만
-                and sim_pend_exec_t != -1
-                and 0 <= sim_pend_node < N
-                and A_target[t, sim_pend_node] == 1): # pending 노드는 지금 가용
-            future_end = min(t + 1 + mbb_k, A_target.shape[0])
-            if future_end > t + 1 and np.any(A_target[t + 1 : future_end, sim_current] == 0):
-                candidate        = sim_pend_node
-                sim_pend_node    = -1
-                sim_pend_exec_t  = -1
-
-        # (3) dwell + hysteresis + ping-pong extra hysteresis guardrail
-        cur_valid = (sim_current != -1 and 0 <= sim_current < N and A_target[t, sim_current] == 1)
-        if candidate != sim_current and candidate != -1 and 0 <= candidate < N and A_target[t, candidate] == 1:
-            if (t - sim_last_switch) >= min_dwell:
-                s_cur = _rel_score(t, sim_current) if cur_valid else -1e9
-                s_new = _rel_score(t, candidate)
-                required = hyst_ratio
-                # ping-pong(A->B->A) 감지: candidate가 t-2 노드이고 최근 스위치 직후면 추가 hysteresis
-                is_pp = (
-                    candidate == sim_prev2
-                    and sim_prev2 != -1
-                    and sim_prev == sim_current
-                    and (t - sim_last_switch) <= pp_window
-                )
-                if is_pp:
-                    required += pp_extra_hyst
-                if not cur_valid or s_new >= s_cur * (1.0 + required):
-                    sim_prev2       = sim_prev
-                    sim_prev        = sim_current
-                    sim_current     = candidate
-                    sim_last_switch = t
-
-        # (4) 현재 연결 실패 처리
-        if sim_current != -1 and A_target[t, sim_current] == 0:
-            if use_pending and sim_pend_exec_t != -1 and 0 <= sim_pend_node < N and A_target[t, sim_pend_node] == 1:
-                sim_prev2       = sim_prev
-                sim_prev        = sim_current
-                sim_current     = sim_pend_node
-                sim_pend_node   = -1
+                    candidate = _best_node_rt(t, avail_now) if len(avail_now) > 0 else -1
+                sim_pend_node = -1
                 sim_pend_exec_t = -1
-                sim_last_switch = t
-            else:
-                # latency-aware greedy fallback
-                avail_now = np.where(A_target[t] == 1)[0]
-                sim_prev2   = sim_prev
-                sim_prev    = sim_current
-                sim_current = int(avail_now[np.argmax(
-                    _lat_scores(t, avail_now, U_target, sim_reliability, L_target, alpha_lat)
-                )]) if len(avail_now) > 0 else -1
-                sim_last_switch = t
+        else:
+            if pred_i <= int(getattr(cfg_te, 'rt_switch_time_offset_max', 1)) and A_target[t, pred_n] == 1:
+                candidate = pred_n
 
-        # (5) reliability EMA 업데이트 (RT 플래너와 동일한 공식)
-        # rollout은 A_target을 "미래 정답"으로 쓰므로 predicted와 actual 모두 A_target으로 근사
-        match = np.ones(N, dtype=np.float32)   # A_target 기준 self-consistent → match=1 기본
-        fp_mask = (A_in[t] == 1) & (A_target[t] == 0) if t < A_in.shape[0] else np.zeros(N, dtype=bool)
-        sim_reliability = rel_alpha * sim_reliability + (1.0 - rel_alpha) * match
-        sim_reliability[fp_mask] *= rel_fp_pen
+        if candidate == sim_current and sim_current != -1 and A_target[t, sim_current] == 0:
+            avail_now = np.where(A_target[t] == 1)[0]
+            if use_pending and sim_pend_exec_t != -1 and 0 <= sim_pend_node < A_target.shape[1] and A_target[t, sim_pend_node] == 1:
+                candidate = sim_pend_node
+                sim_pend_node = -1
+                sim_pend_exec_t = -1
+            else:
+                candidate = _best_node_rt(t, avail_now) if len(avail_now) > 0 else -1
+
+        corrected = candidate
+
+        # guardrail
+        can_switch = True
+        if corrected != sim_current and corrected != -1:
+            if current_valid_now and (t - sim_last_switch_t) < min_dwell:
+                can_switch = False
+
+            if can_switch and current_valid_now and sim_current != -1:
+                s_cur = _score_rt(t, sim_current)
+                s_new = _score_rt(t, corrected)
+                eff_ratio = hyst_ratio
+                if prev1 := (sim_plan_hist[-1] if len(sim_plan_hist) >= 1 else -1):
+                    pass
+                if len(sim_plan_hist) >= 2:
+                    prev1 = sim_plan_hist[-1]
+                    prev2 = sim_plan_hist[-2]
+                    if corrected == prev2 and sim_current == prev1 and (t - sim_last_switch_t) <= pp_window:
+                        eff_ratio += pp_extra
+                if not (s_new >= s_cur * (1.0 + eff_ratio)):
+                    can_switch = False
+
+            if not can_switch:
+                corrected = sim_current
+
+        if corrected != sim_current:
+            sim_prev = sim_current
+            sim_current = corrected
+            sim_last_switch_t = t
+
+        if sim_current != -1 and A_target[t, sim_current] == 0:
+            sim_prev, sim_current = sim_current, -1
+
+        sim_plan_hist.append(int(sim_current) if sim_current is not None else -1)
+        if len(sim_plan_hist) > max(4, pp_window + 2):
+            sim_plan_hist = sim_plan_hist[-max(4, pp_window + 2):]
+
+        match = (A_in[t].astype(np.int32) == A_target[t].astype(np.int32)).astype(np.float32)
+        sim_reliability = alpha_rel * sim_reliability + (1.0 - alpha_rel) * match
+        fp_mask = (A_in[t] == 1) & (A_target[t] == 0)
+        sim_reliability[fp_mask] *= fp_pen
         sim_reliability = np.clip(sim_reliability, 0.05, 1.0)
 
         sim_hist = np.vstack([sim_hist[1:], A_in[t:t+1, :]])
 
-    return total / float(K)
+    return total / float(max(1, K))
 
 
 def evaluate_on_val_seeds(
@@ -885,8 +875,7 @@ def train_on_seed_pool(
             A_in = np.asarray(pred_env.A_final, dtype=np.float32)
             A_target = np.asarray(actual_env.A_final, dtype=np.float32)
             U_target = np.asarray(actual_env.utility, dtype=np.float32)
-            _L_raw = getattr(actual_env, 'latency_ms', None)
-            L_target = np.asarray(_L_raw) if _L_raw is not None else None
+            L_target = np.asarray(getattr(actual_env, 'latency_ms', np.zeros_like(U_target)), dtype=np.float32)
             T, N2 = A_in.shape
             if N2 != N:
                 raise ValueError(f'num_nodes mismatch in training: expected {N}, got {N2}')
@@ -944,13 +933,16 @@ def train_on_seed_pool(
                 loss_rollout = _mini_rollout_penalty(transformer, online_consistency, A_in, A_target, U_target, t, current_node_approx, prev_node_approx, cfg_te, device, L_target=L_target)
                 loss_rl = float(getattr(cfg_te, 'alpha_oracle_loss', 0.6)) * loss_oracle + float(getattr(cfg_te, 'beta_pred_action_loss', 0.4)) * loss_pred + float(getattr(cfg_te, 'rollout_loss_weight', 0.35)) * loss_rollout
 
-                # BC (imitation) loss: teacher = oracle (best_i, best_n) — RT-semantics target
-                # 현재 슬롯 greedy(reactive)가 아닌 reward-optimal 예측형 타겟을 사용해
-                # pending/예약형 정책 학습과 충돌 없이 안정화 효과만 제공
-                loss_bc = (
-                    F.cross_entropy(offset_logits, best_i_t) +
-                    F.cross_entropy(node_logits, best_n_t)
-                )
+                # BC (imitation) loss: teacher = greedy best available node at slot t, offset = 0
+                avail_t_bc = np.where(A_target[t] == 1)[0]
+                if len(avail_t_bc) > 0:
+                    teacher_n_bc = int(avail_t_bc[np.argmax(U_target[t, avail_t_bc])])
+                    loss_bc = (
+                        F.cross_entropy(offset_logits, torch.zeros(1, dtype=torch.long, device=device)) +
+                        F.cross_entropy(node_logits, torch.tensor([teacher_n_bc], dtype=torch.long, device=device))
+                    )
+                else:
+                    loss_bc = offset_logits.sum() * 0.0
 
                 # discrete argmax for pred reward tracking
                 pred_i = int(offset_logits[0].argmax().item())
@@ -992,29 +984,38 @@ def train_on_seed_pool(
                     return_debug=True,
                 )
             if len(df_val) > 0:
-                val_avail = float(df_val['Availability'].mean())
-                val_qoe = float(df_val['EffectiveQoE'].mean())
-                val_pp = float(df_val['PingPong_Ratio'].mean())
-                val_hof = float(df_val['HO_Failure_Ratio'].mean())
-                val_latency = float(df_val['MeanLatency_ms'].mean()) if 'MeanLatency_ms' in df_val.columns else 50.0
-                val_jitter  = float(df_val['MeanJitter_ms'].mean())  if 'MeanJitter_ms'  in df_val.columns else 70.0
-                val_ho      = float(df_val['HO_Attempt_Count'].mean()) if 'HO_Attempt_Count' in df_val.columns else 300.0
-                lat_pen = val_latency / 50.0
-                jit_pen = val_jitter  / 70.0
-                ho_pen  = val_ho      / 300.0
+                val_avail    = float(df_val['Availability'].mean())
+                val_qoe      = float(df_val['EffectiveQoE'].mean())
+                val_pp       = float(df_val['PingPong_Ratio'].mean())
+                val_hof      = float(df_val['HO_Failure_Ratio'].mean())
+                val_latency  = float(df_val['MeanLatency_ms'].mean())      if 'MeanLatency_ms'      in df_val.columns else 100.0
+                val_jitter   = float(df_val['MeanJitter_ms'].mean())       if 'MeanJitter_ms'       in df_val.columns else 1000.0
+                val_interrupt= float(df_val['MeanInterruption_ms'].mean()) if 'MeanInterruption_ms' in df_val.columns else 1000.0
+                val_ho       = float(df_val['HO_Attempt_Count'].mean())    if 'HO_Attempt_Count'    in df_val.columns else 300.0
+                # 명시적 metric 중심 val_score
+                # QoE는 로그에만 보존, best 선택에는 미포함 (avail/lat/int/jit와 중복 방지)
+                lat_term = float(np.clip(1.0 - val_latency  / 100.0,  0.0, 1.0))
+                jit_term = float(np.clip(1.0 - val_jitter   / 1000.0, 0.0, 1.0))
+                int_term = float(np.clip(1.0 - val_interrupt / 1000.0, 0.0, 1.0))
+                ho_pen   = val_ho / 300.0
                 val_score = (
-                    cfg_te.val_w_avail   * val_avail
-                    + cfg_te.val_w_qoe   * val_qoe
-                    - cfg_te.val_w_pp    * val_pp
-                    - cfg_te.val_w_hof   * val_hof
-                    - cfg_te.val_w_latency * lat_pen
-                    - cfg_te.val_w_jitter  * jit_pen
-                    - cfg_te.val_w_ho      * ho_pen
+                    cfg_te.val_w_avail     * val_avail
+                    + cfg_te.val_w_latency   * lat_term
+                    + cfg_te.val_w_interrupt * int_term
+                    + cfg_te.val_w_jitter    * jit_term
+                    - cfg_te.val_w_pp        * val_pp
+                    - cfg_te.val_w_hof       * val_hof
+                    - cfg_te.val_w_ho        * ho_pen
                 )
-                row['val_score'] = val_score
-                row['val_latency'] = val_latency
-                row['val_jitter'] = val_jitter
-                row['val_ho'] = val_ho
+                row['val_score']     = val_score
+                row['val_avail']     = val_avail
+                row['val_qoe']       = val_qoe      # 로그 전용
+                row['val_latency']   = val_latency
+                row['val_interrupt'] = val_interrupt
+                row['val_jitter']    = val_jitter
+                row['val_ho']        = val_ho
+                row['val_pp']        = val_pp
+                row['val_hof']       = val_hof
                 if len(df_dbg) > 0:
                     row["val_rt_acceptance_rate"] = float(df_dbg["rt_acceptance_rate"].mean())
                     row["val_rt_fallback_rate"] = float(df_dbg["rt_fallback_rate"].mean())
@@ -1023,6 +1024,7 @@ def train_on_seed_pool(
                     row["val_rt_model_applied"] = float(df_dbg["rt_model_applied"].mean())
                     row["val_rt_fallback_used"] = float(df_dbg["rt_fallback_used"].mean())
                     row["val_rt_guardrail_block"] = float(df_dbg["rt_guardrail_block"].mean())
+                    row["val_rt_make_before_break"] = float(df_dbg['rt_make_before_break'].mean()) if 'rt_make_before_break' in df_dbg.columns else float('nan')
                 else:
                     row["val_rt_acceptance_rate"] = float("nan")
                     row["val_rt_fallback_rate"] = float("nan")
@@ -1030,14 +1032,15 @@ def train_on_seed_pool(
                     row["val_rt_model_proposed"] = float("nan")
                     row["val_rt_model_applied"] = float("nan")
                     row["val_rt_fallback_used"] = float("nan")
-                    row["val_rt_guardrail_block"] = float("nan")
+                    row["val_rt_guardrail_block"] = float('nan')
+                    row['val_rt_make_before_break'] = float('nan')
 
                 print(
                     f"[val] epoch {epoch+1:02d}/{cfg_te.epochs} | "
                     f"score={val_score:.4f} | "
-                    f"Avail={val_avail:.4f} | QoE={val_qoe:.4f} | "
-                    f"PP={val_pp:.4f} | HOF={val_hof:.4f} | "
-                    f"Lat={val_latency:.1f}ms | Jit={val_jitter:.1f}ms | HO={val_ho:.0f} | "
+                    f"Avail={val_avail:.4f} | QoE={val_qoe:.4f}(log) | "
+                    f"Lat={val_latency:.1f}ms | Int={val_interrupt:.1f}ms | Jit={val_jitter:.1f}ms | "
+                    f"PP={val_pp:.4f} | HOF={val_hof:.4f} | HO={val_ho:.0f} | "
                     f"accept={row['val_rt_acceptance_rate']:.3f} | "
                     f"fallback={row['val_rt_fallback_rate']:.3f} | "
                     f"block={row['val_rt_guardrail_block_rate']:.3f}",
@@ -1277,11 +1280,19 @@ def build_learned_realtime_corrected_plan(
 
     def _score(t_: int, n_: int) -> float:
         # utility * reliability — latency penalty (alpha_lat * latency_ms / 50ms baseline)
+        if n_ < 0 or n_ >= N or A_actual[t_, n_] != 1:
+            return -1e9
         base = float(U_actual[t_, n_] * reliability[n_])
-        if L_actual is not None and n_ < L_actual.shape[1]:
+        if L_actual is not None and t_ < L_actual.shape[0] and n_ < L_actual.shape[1]:
             lat_pen = float(L_actual[t_, n_]) / 50.0
             return base - _alpha_lat * lat_pen
         return base
+
+    def _best_actual_node_with_latency(t_: int, avail_idx: np.ndarray) -> int:
+        if len(avail_idx) == 0:
+            return -1
+        scores = np.array([_score(t_, int(n)) for n in avail_idx], dtype=np.float32)
+        return int(avail_idx[np.argmax(scores)])
 
     for t in range(T):
         # 현재 슬롯까지는 실제 관측값 사용 가능하다고 가정(실시간 측정)
@@ -1295,10 +1306,10 @@ def build_learned_realtime_corrected_plan(
 
         # ------------------------ (A) 기본 제안 산출 ------------------------
         if t < L:
-            # warmup: latency-aware 신뢰도 점수 최대 선택
+            # warmup: 현재 실제 가용 후보 중 신뢰도 반영 점수 최대 선택
             avail = np.where(A_actual[t] == 1)[0]
             if len(avail) > 0:
-                proposed = int(avail[np.argmax(_lat_scores(t, avail, U_actual, reliability, L_actual, _alpha_lat))])
+                proposed = _best_actual_node_with_latency(t, avail)
             else:
                 proposed = -1
 
@@ -1370,10 +1381,10 @@ def build_learned_realtime_corrected_plan(
                         dbg_model_proposed += 1
                         dbg_pending_executed += 1
                     else:
-                        # 예약 노드 불가 → latency-aware 최우선 가용 노드로 대체 실행
+                        # 예약 노드 불가 → 실행 시점의 최우선 가용 노드로 대체 실행
                         avail_now = np.where(A_actual[t] == 1)[0]
                         if len(avail_now) > 0:
-                            best = int(avail_now[np.argmax(_lat_scores(t, avail_now, U_actual, reliability, L_actual, _alpha_lat))])
+                            best = _best_actual_node_with_latency(t, avail_now)
                             if best != current_node:
                                 proposed = best
                                 dbg_model_proposed += 1
@@ -1421,8 +1432,8 @@ def build_learned_realtime_corrected_plan(
                 elif cfg_te.rt_use_actual_current_slot_fallback:
                     avail = np.where(A_actual[t] == 1)[0]
                     if len(avail) > 0:
-                        # latency-aware 신뢰도 + utility 기반 즉시 보정
-                        fallback = int(avail[np.argmax(_lat_scores(t, avail, U_actual, reliability, L_actual, _alpha_lat))])
+                        # 신뢰도 반영 + 현재 actual utility 기반 즉시 보정
+                        fallback = _best_actual_node_with_latency(t, avail)
 
                         # 현재 연결 유지가 유효하고 제안이 low_rel이면 유지를 우선할 수도 있음
                         if current_valid_now and low_rel:

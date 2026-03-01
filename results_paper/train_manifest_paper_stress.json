@@ -1,16 +1,13 @@
 {
   "scenario": "paper_stress",
   "preset": "balanced",
-  "epochs": 5,
+  "epochs": 2,
   "max_sats": 100,
   "train_seeds": [
-    0,
-    1,
-    2
+    0
   ],
   "val_seeds": [
-    3,
-    4
+    1
   ],
   "test_seeds": [
     20,
@@ -34,9 +31,15 @@
   "rollout_steps": 1,
   "rollout_loss_weight": 0.3,
   "reward_time_offset_penalty": 0.0,
-  "val_w_latency": 0.08,
-  "val_w_jitter": 0.03,
-  "val_w_ho": 0.02,
+  "val_score_weights": {
+    "w_avail": 0.5,
+    "w_latency": 0.18,
+    "w_interrupt": 0.12,
+    "w_jitter": 0.08,
+    "w_pp": 0.25,
+    "w_hof": 0.25,
+    "w_ho": 0.05
+  },
   "lambda_bc": 0.02,
   "rt_fallback_alpha_latency": 0.1,
   "train_use_history_augmentation": true,
@@ -57,5 +60,5 @@
   "rt_enable_pending": true,
   "rt_enable_mbb": true,
   "rt_mbb_lookahead": 1,
-  "elapsed_sec": 694.2265017032623
+  "elapsed_sec": 183.86386585235596
 }

@@ -43,12 +43,13 @@ def main():
     ap.add_argument("--rollout_loss_weight",        type=float, default=0.0)
     ap.add_argument("--reward_time_offset_penalty", type=float, default=None,
                     help="offset 패널티 강도 (default: cfg 기본값 0.02). 올리면 모델이 낮은 offset 선호")
-    ap.add_argument("--val_w_latency", type=float, default=None,
-                    help="validation best-score latency penalty weight")
-    ap.add_argument("--val_w_jitter", type=float, default=None,
-                    help="validation best-score jitter penalty weight")
-    ap.add_argument("--val_w_ho", type=float, default=None,
-                    help="validation best-score HO-attempt penalty weight")
+    ap.add_argument("--val_w_avail",     type=float, default=None, help="val_score: availability weight (default 0.50)")
+    ap.add_argument("--val_w_latency",   type=float, default=None, help="val_score: latency term weight (default 0.18)")
+    ap.add_argument("--val_w_interrupt", type=float, default=None, help="val_score: interruption term weight (default 0.12)")
+    ap.add_argument("--val_w_jitter",    type=float, default=None, help="val_score: jitter term weight (default 0.08)")
+    ap.add_argument("--val_w_pp",        type=float, default=None, help="val_score: pingpong penalty weight (default 0.25)")
+    ap.add_argument("--val_w_hof",       type=float, default=None, help="val_score: HO failure penalty weight (default 0.25)")
+    ap.add_argument("--val_w_ho",        type=float, default=None, help="val_score: HO attempt penalty weight (default 0.05)")
     ap.add_argument("--lambda_bc", type=float, default=None,
                     help="behavior cloning auxiliary loss weight")
     ap.add_argument("--rt_fallback_alpha_latency", type=float, default=None,
@@ -108,12 +109,14 @@ def main():
     cfg_te.rollout_loss_weight = float(args.rollout_loss_weight)
     if args.reward_time_offset_penalty is not None:
         cfg_te.reward_time_offset_penalty = float(args.reward_time_offset_penalty)
-    if args.val_w_latency is not None:
-        cfg_te.val_w_latency = float(args.val_w_latency)
-    if args.val_w_jitter is not None:
-        cfg_te.val_w_jitter = float(args.val_w_jitter)
-    if args.val_w_ho is not None:
-        cfg_te.val_w_ho = float(args.val_w_ho)
+    # val score weights — CLI로 지정 시 cfg 기본값 위에 덮어씀
+    if args.val_w_avail     is not None: cfg_te.val_w_avail     = float(args.val_w_avail)
+    if args.val_w_latency   is not None: cfg_te.val_w_latency   = float(args.val_w_latency)
+    if args.val_w_interrupt is not None: cfg_te.val_w_interrupt = float(args.val_w_interrupt)
+    if args.val_w_jitter    is not None: cfg_te.val_w_jitter    = float(args.val_w_jitter)
+    if args.val_w_pp        is not None: cfg_te.val_w_pp        = float(args.val_w_pp)
+    if args.val_w_hof       is not None: cfg_te.val_w_hof       = float(args.val_w_hof)
+    if args.val_w_ho        is not None: cfg_te.val_w_ho        = float(args.val_w_ho)
     if args.lambda_bc is not None:
         cfg_te.lambda_bc = float(args.lambda_bc)
     if args.rt_fallback_alpha_latency is not None:
@@ -174,11 +177,18 @@ def main():
         "rollout_steps": cfg_te.rollout_steps,
         "rollout_loss_weight": cfg_te.rollout_loss_weight,
         "reward_time_offset_penalty": cfg_te.reward_time_offset_penalty,
-        "val_w_latency": getattr(cfg_te, "val_w_latency", None),
-        "val_w_jitter": getattr(cfg_te, "val_w_jitter", None),
-        "val_w_ho": getattr(cfg_te, "val_w_ho", None),
-        "lambda_bc": getattr(cfg_te, "lambda_bc", None),
-        "rt_fallback_alpha_latency": getattr(cfg_te, "rt_fallback_alpha_latency", None),
+        # val_score_weights: 실제 적용된 가중치 전체 기록 (CLI/코드 어느 쪽에서 바꿔도 반영됨)
+        "val_score_weights": {
+            "w_avail":     cfg_te.val_w_avail,
+            "w_latency":   cfg_te.val_w_latency,
+            "w_interrupt": getattr(cfg_te, "val_w_interrupt", 0.12),
+            "w_jitter":    cfg_te.val_w_jitter,
+            "w_pp":        cfg_te.val_w_pp,
+            "w_hof":       cfg_te.val_w_hof,
+            "w_ho":        cfg_te.val_w_ho,
+        },
+        "lambda_bc": cfg_te.lambda_bc,
+        "rt_fallback_alpha_latency": cfg_te.rt_fallback_alpha_latency,
         "train_use_history_augmentation": cfg_te.train_use_history_augmentation,
         "train_aug_flip_prob": cfg_te.train_aug_flip_prob,
         "train_aug_dropout_prob": cfg_te.train_aug_dropout_prob,
