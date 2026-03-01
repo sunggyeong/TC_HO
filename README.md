@@ -67,11 +67,11 @@ TC_HO/
 - **논문용 기본**: 학습 시드 15개(0~14), 검증 5개(15~19), 에포크 30, `reward_learnable` 권장.
 - 시드/에포크를 지정하지 않으면 위 논문용 기본값이 적용됩니다.
 
-### 논문용 (두 시나리오, max_sats=100, 가중치 학습 켜기)
+### 논문용 (두 시나리오, max_sats=100)
 
 ```bash
-python -m paper_pkg.train --scenario paper_stress --reward_learnable --max_sats 100
-python -m paper_pkg.train --scenario normal --reward_learnable --max_sats 100
+python -m paper_pkg.train --scenario paper_stress  --max_sats 100
+python -m paper_pkg.train --scenario normal  --max_sats 100
 ```
 
 저장 위치: `results_paper/weights_tc_paper_stress.pth`, `results_paper/weights_tc_normal.pth`
@@ -80,6 +80,16 @@ python -m paper_pkg.train --scenario normal --reward_learnable --max_sats 100
 
 ```bash
 python -m paper_pkg.train --scenario paper_stress --reward_learnable --max_sats 100 --epochs 1 --train_seeds 0 --val_seeds 1
+```
+
+## 실험용
+```bash
+python  -m paper_pkg.train --scenario paper_stress --max_sats 100 --epochs 8 --train_seeds 0 1 2 3 4 --val_seeds 5 6 7 --L 10 --H 5 --rollout_loss_weight 0.3 --val_w_latency 0.12 --val_w_jitter 0.03 --val_w_ho 0.02 --rt_fallback_alpha_latency 0.15
+python  -m paper_pkg.train --scenario normal --max_sats 100 --epochs 8 --train_seeds 0 1 2 3 4 --val_seeds 5 6 7 --L 10 --H 5 --rollout_loss_weight 0.3 --val_w_latency 0.12 --val_w_jitter 0.03 --val_w_ho 0.02 --rt_fallback_alpha_latency 0.15
+
+python -m paper_pkg.eval --scenario paper_stress --max_sats 100 --seeds 20 21 22 23 24 --weights results_paper/weights_tc_paper_stress.pth --results_dir results_eval/paper_stress --rt_debug
+
+python -m paper_pkg.eval --scenario normal --max_sats 100 --seeds 20 21 22 23 24 --weights results_paper/weights_tc_normal.pth --results_dir results_eval/normal --rt_debug
 ```
 
 ### 주요 옵션
@@ -104,13 +114,21 @@ python -m paper_pkg.train --scenario paper_stress --reward_learnable --max_sats 
 ### 시나리오별로 결과 폴더 분리
 
 ```bash
-python -m paper_pkg.eval --scenario paper_stress --max_sats 100 --seeds 20 21 22 23 24 25 26 27 28 29 --weights results_paper/weights_tc_paper_stress.pth --results_dir results_eval/paper_stress
+python -m paper_pkg.eval --scenario paper_stress --max_sats 100 --seeds 20 21 22 23 24 25 26 27 28 29 --weights results_paper/weights_tc_paper_stress.pth --results_dir results_eval/paper_stress 
 
 python -m paper_pkg.eval --scenario normal --max_sats 100 --seeds 20 21 22 23 24 25 26 27 28 29 --weights results_paper/weights_tc_normal.pth --results_dir results_eval/normal
 ```
 
 생성 파일:  
 `results_eval/<시나리오>/exp_paper_runs.csv`, `exp_paper_summary.csv`
+
+## 평가 디버깅 
+
+```bash
+python -m paper_pkg.eval --scenario paper_stress --max_sats 100 --seeds 20 21 22 23 --weights results_paper/weights_tc_paper_stress.pth --results_dir results_eval/paper_stress --rt_debug
+
+python -m paper_pkg.eval --scenario normal --max_sats 100 --seeds 20 21 22 23 24  --weights results_paper/weights_tc_normal.pth --results_dir results_eval/normal --rt_debug
+```
 
 ### 주요 옵션
 
