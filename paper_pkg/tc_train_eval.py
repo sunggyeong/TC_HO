@@ -237,7 +237,7 @@ def _build_consistency_condition(
     return torch.cat([future_pred_flat, U_flat, cur_oh, prev_oh], dim=-1)  # (1, 2*H*N_model + 2*N_model)
 
 
-def save_weights(transformer, consistency, weight_path: str, reward_weights_module=None):
+def save_weights(transformer, consistency, weight_path: str, reward_weights_module=None, cfg_te: TrainEvalRealtimeConfig | None = None):
     Path(weight_path).parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "transformer_state_dict": transformer.state_dict(),
@@ -246,6 +246,23 @@ def save_weights(transformer, consistency, weight_path: str, reward_weights_modu
         "L": getattr(transformer, "L", None),
         "H": getattr(transformer, "H", None),
     }
+    if cfg_te is not None:
+        payload["cfg_te_state"] = {
+            "rt_enable_pending": bool(getattr(cfg_te, "rt_enable_pending", True)),
+            "rt_enable_mbb": bool(getattr(cfg_te, "rt_enable_mbb", True)),
+            "rt_pending_freeze_horizon": int(getattr(cfg_te, "rt_pending_freeze_horizon", 1)),
+            "rt_pending_advance_margin": int(getattr(cfg_te, "rt_pending_advance_margin", 1)),
+            "rt_mbb_lookahead": int(getattr(cfg_te, "rt_mbb_lookahead", 1)),
+            "rt_enable_guardrails": bool(getattr(cfg_te, "rt_enable_guardrails", True)),
+            "rt_min_dwell": int(getattr(cfg_te, "rt_min_dwell", 1)),
+            "rt_hysteresis_ratio": float(getattr(cfg_te, "rt_hysteresis_ratio", 0.02)),
+            "rt_hysteresis_abs": float(getattr(cfg_te, "rt_hysteresis_abs", 0.0)),
+            "rt_pingpong_window": int(getattr(cfg_te, "rt_pingpong_window", 4)),
+            "rt_pingpong_extra_hysteresis_ratio": float(getattr(cfg_te, "rt_pingpong_extra_hysteresis_ratio", 0.04)),
+            "rt_switch_time_offset_max": int(getattr(cfg_te, "rt_switch_time_offset_max", 1)),
+            "train_inject_rt_context": bool(getattr(cfg_te, "train_inject_rt_context", True)),
+            "train_rt_context_blend": float(getattr(cfg_te, "train_rt_context_blend", 0.3)),
+        }
     if reward_weights_module is not None:
         payload["reward_weights_state_dict"] = reward_weights_module.state_dict()
     torch.save(payload, weight_path)
@@ -633,9 +650,19 @@ def _augment_history_matrix(
     cfg_te: TrainEvalRealtimeConfig,
     current_node: int = -1,
     last_switch_t: int = 0,
+    *,
+    deterministic: bool = False,
 ) -> np.ndarray:
+    """
+    학습 시: flip/drop augmentation + RT 컨텍스트(current_node, last_switch_t) 블렌딩.
+    추론 시: deterministic=True 로 호출하면 flip/drop 없이 RT 컨텍스트만 주입해
+    학습 입력과 추론 입력을 동일한 의미 공간으로 맞춘다.
+    """
     aug = np.array(history_A, copy=True)
-    if not getattr(cfg_te, "train_use_history_augmentation", True):
+    if deterministic:
+        # 추론 시: 확률적 augmentation 없음, 아래 RT 컨텍스트만 적용
+        pass
+    elif not getattr(cfg_te, "train_use_history_augmentation", True):
         # RT 컨텍스트는 augmentation 플래그와 독립적으로 주입 가능
         pass
     else:
@@ -757,7 +784,14 @@ def _mini_rollout_penalty(
         if t >= A_target.shape[0] - H:
             break
 
-        hist = _augment_history_matrix(sim_hist, SimpleNamespace(phase=None), t, cfg_te)
+        hist = _augment_history_matrix(
+            sim_hist,
+            SimpleNamespace(phase=None),
+            t,
+            cfg_te,
+            current_node=sim_current,
+            last_switch_t=sim_last_switch_t,
+        )
         state_tensor = torch.tensor(hist, dtype=torch.float32, device=device).unsqueeze(0)
         future_pred = transformer(state_tensor)
         avail_flat = future_pred.view(1, -1).detach()
@@ -782,8 +816,29 @@ def _mini_rollout_penalty(
 
         if use_pending:
             new_exec_t = t + pred_i
-            if sim_pend_exec_t == -1 or new_exec_t <= sim_pend_exec_t:
-                sim_pend_node = pred_n
+            new_n = int(pred_n)
+            _freeze_h = int(getattr(cfg_te, 'rt_pending_freeze_horizon', 1))
+            _adv_margin = int(getattr(cfg_te, 'rt_pending_advance_margin', 1))
+
+            pending_node_lost = (
+                sim_pend_exec_t != -1
+                and 0 <= sim_pend_node < A_target.shape[1]
+                and A_target[t, sim_pend_node] == 0
+            )
+            pending_due_soon = (
+                sim_pend_exec_t != -1
+                and (sim_pend_exec_t - t) <= _freeze_h
+            )
+
+            replace_ok = False
+            if sim_pend_exec_t == -1 or pending_node_lost:
+                replace_ok = True
+            elif not pending_due_soon:
+                if new_exec_t + _adv_margin < sim_pend_exec_t:
+                    replace_ok = True
+
+            if replace_ok:
+                sim_pend_node = new_n
                 sim_pend_exec_t = new_exec_t
 
             if (use_mbb and current_valid_now and sim_pend_exec_t != -1 and 0 <= sim_pend_node < A_target.shape[1]
@@ -1108,6 +1163,10 @@ def train_on_seed_pool(
                     rt_accept  = float(df_dbg["rt_acceptance_rate"].mean())
                     rt_fallback= float(df_dbg["rt_fallback_rate"].mean())
                     rt_block   = float(df_dbg["rt_guardrail_block_rate"].mean())
+                    row["val_rt_switch_intent_rate"] = float(df_dbg["rt_switch_intent_rate"].mean()) if "rt_switch_intent_rate" in df_dbg.columns else float("nan")
+                    row["val_rt_intended_accept_rate"] = float(df_dbg["rt_intended_accept_rate"].mean()) if "rt_intended_accept_rate" in df_dbg.columns else float("nan")
+                    row["val_rt_model_decisions"] = float(df_dbg["rt_model_decisions"].mean()) if "rt_model_decisions" in df_dbg.columns else float("nan")
+                    row["val_rt_switch_intended"] = float(df_dbg["rt_switch_intended"].mean()) if "rt_switch_intended" in df_dbg.columns else float("nan")
                     row["val_rt_acceptance_rate"]    = rt_accept
                     row["val_rt_fallback_rate"]      = rt_fallback
                     row["val_rt_guardrail_block_rate"]= rt_block
@@ -1118,7 +1177,9 @@ def train_on_seed_pool(
                     row["val_rt_make_before_break"]  = float(df_dbg['rt_make_before_break'].mean()) if 'rt_make_before_break' in df_dbg.columns else float('nan')
                 else:
                     rt_accept = rt_fallback = rt_block = float('nan')
-                    for k in ["val_rt_acceptance_rate","val_rt_fallback_rate","val_rt_guardrail_block_rate",
+                    for k in ["val_rt_switch_intent_rate","val_rt_intended_accept_rate",
+                              "val_rt_model_decisions","val_rt_switch_intended",
+                              "val_rt_acceptance_rate","val_rt_fallback_rate","val_rt_guardrail_block_rate",
                               "val_rt_model_proposed","val_rt_model_applied","val_rt_fallback_used",
                               "val_rt_guardrail_block","val_rt_make_before_break"]:
                         row[k] = float('nan')
@@ -1170,7 +1231,7 @@ def train_on_seed_pool(
 
                 if save_metric > best_val_score:
                     best_val_score = save_metric
-                    save_weights(transformer, online_consistency, cfg_te.weight_path, reward_weights_module)
+                    save_weights(transformer, online_consistency, cfg_te.weight_path, reward_weights_module, cfg_te=cfg_te)
                     print(f"[best] saved best checkpoint: {cfg_te.weight_path}")
             transformer.train(); online_consistency.train()
 
@@ -1181,7 +1242,7 @@ def train_on_seed_pool(
     hist_df.to_csv(Path(cfg_te.results_dir) / 'train_history_real_env.csv', index=False)
     print(f"[OK] train history saved: {Path(cfg_te.results_dir) / 'train_history_real_env.csv'}")
     if best_val_score == -float('inf'):
-        save_weights(transformer, online_consistency, cfg_te.weight_path, reward_weights_module)
+        save_weights(transformer, online_consistency, cfg_te.weight_path, reward_weights_module, cfg_te=cfg_te)
     return transformer, online_consistency, hist_df
 
 
@@ -1200,12 +1261,28 @@ def _predict_target_from_history(
     U_slice: np.ndarray | None = None,   # (H, N_env) utility forecast; padded internally if needed
     current_node: int = -1,
     prev_node: int = -1,
+    *,
+    cfg_te: TrainEvalRealtimeConfig | None = None,
+    t: int = 0,
+    actual_env: Any = None,
+    last_switch_t: int = -10**9,
 ) -> Tuple[int, int]:
     """
     history_A: (L, N) binary matrix (already padded to model N if needed)
     U_slice:   (H, N_env) utility — padded to model N inside _build_consistency_condition
     return:    (target_time_offset, target_node_idx)
+
+    학습 시와 동일한 입력 공간을 쓰려면 cfg_te, t, actual_env, current_node, last_switch_t 를 넘겨
+    RT 컨텍스트가 주입된 history를 사용한다 (deterministic=True, flip/drop 없음).
     """
+    if cfg_te is not None and getattr(cfg_te, "train_inject_rt_context", True):
+        env_for_phase = actual_env if actual_env is not None else SimpleNamespace(phase=None)
+        history_A = _augment_history_matrix(
+            history_A, env_for_phase, t, cfg_te,
+            current_node=current_node,
+            last_switch_t=last_switch_t,
+            deterministic=True,
+        )
     state_tensor = torch.tensor(history_A, dtype=torch.float32, device=device).unsqueeze(0)
 
     if U_slice is None:
@@ -1296,6 +1373,10 @@ def build_learned_offline_plan_from_pred_env(
             U_slice=u_slice,
             current_node=current_node,
             prev_node=prev_node,
+            cfg_te=cfg_te,
+            t=t,
+            actual_env=pred_env,
+            last_switch_t=last_switch_t,
         )
         target_node_idx = min(max(target_node_idx, 0), N_env - 1)
 
@@ -1390,6 +1471,8 @@ def build_learned_realtime_corrected_plan(
 
     # 디버그 카운터 (online TC 동작 분석용)
     dbg_total_slots = T
+    dbg_model_decisions = 0             # 모델 추론이 수행된 슬롯 수 (t>=L)
+    dbg_switch_intended = 0             # 모델이 "현재와 다른 노드로 스위치"를 의도한 횟수
     dbg_model_proposed = 0              # 모델이 target_time_offset==0으로 switch 제안한 슬롯 수
     dbg_model_proposed_valid = 0        # 그 중 실제 가용 슬롯인 경우
     dbg_model_applied = 0               # 최종 플랜에서 모델 제안이 그대로 반영된 슬롯 수
@@ -1438,6 +1521,7 @@ def build_learned_realtime_corrected_plan(
             corrected = proposed
 
         else:
+            dbg_model_decisions += 1
             # history는 "과거 actual 관측 반영 + (미래는 여전히 predicted)"
             history_A = A_obs_corrected[t - L : t, :]  # (L, N)
             if N < N_model:
@@ -1457,6 +1541,10 @@ def build_learned_realtime_corrected_plan(
                 U_slice=u_slice_rt,
                 current_node=current_node,
                 prev_node=prev1,
+                cfg_te=cfg_te,
+                t=t,
+                actual_env=actual_env,
+                last_switch_t=last_switch_t,
             )
             target_node_idx = min(max(target_node_idx, 0), N - 1)
 
@@ -1550,6 +1638,8 @@ def build_learned_realtime_corrected_plan(
 
             if proposed_valid_now:
                 dbg_model_proposed_valid += 1
+            if proposed is not None and proposed >= 0 and proposed < N and proposed != current_node:
+                dbg_switch_intended += 1
 
             low_rel = False
             if proposed is not None and proposed >= 0 and proposed < N:
@@ -1671,6 +1761,8 @@ def build_learned_realtime_corrected_plan(
         total_effective = max(1, dbg_total_slots - cfg_te.L)
         print("[RT-TC debug]")
         print(f"  total_slots                = {dbg_total_slots}")
+        print(f"  model_decisions            = {dbg_model_decisions}")
+        print(f"  switch_intended            = {dbg_switch_intended}")
         print(f"  model_proposed_slots       = {dbg_model_proposed}")
         print(f"  model_proposed_valid_slots = {dbg_model_proposed_valid}")
         print(f"  model_applied_switches     = {dbg_model_applied}")
@@ -1684,6 +1776,8 @@ def build_learned_realtime_corrected_plan(
 
     debug_stats = {
         "rt_total_slots": int(dbg_total_slots),
+        "rt_model_decisions": int(dbg_model_decisions),
+        "rt_switch_intended": int(dbg_switch_intended),
         "rt_model_proposed": int(dbg_model_proposed),
         "rt_model_proposed_valid": int(dbg_model_proposed_valid),
         "rt_model_applied": int(dbg_model_applied),
@@ -1695,6 +1789,10 @@ def build_learned_realtime_corrected_plan(
         "rt_make_before_break": int(dbg_make_before_break),
     }
     den = max(1, int(dbg_model_proposed))
+    den_dec = max(1, int(dbg_model_decisions))
+    den_intended = max(1, int(dbg_switch_intended))
+    debug_stats["rt_switch_intent_rate"] = float(dbg_switch_intended) / float(den_dec)
+    debug_stats["rt_intended_accept_rate"] = float(dbg_model_applied) / float(den_intended)
     debug_stats["rt_acceptance_rate"] = float(dbg_model_applied) / float(den)
     debug_stats["rt_fallback_rate"] = float(dbg_fallback_used) / float(den)
     debug_stats["rt_guardrail_block_rate"] = float(dbg_guardrail_block) / float(den)

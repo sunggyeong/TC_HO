@@ -100,6 +100,9 @@ class ProposedTCPlanner:
         self.enable_pending = enable_pending
         self.pending_freeze_horizon = pending_freeze_horizon
         self.pending_advance_margin = pending_advance_margin
+        # 학습 입력과 동일한 의미공간 정렬용 RT context 주입 옵션
+        self.inject_rt_context = True
+        self.rt_context_blend = 0.3
         self.num_nodes = None
         self.transformer = None
         self.consistency = None
@@ -114,12 +117,31 @@ class ProposedTCPlanner:
             checkpoint = torch.load(self.weight_path, map_location=self.device)
             self.transformer.load_state_dict(checkpoint['transformer_state_dict'])
             self.consistency.load_state_dict(checkpoint['consistency_state_dict'])
+            cfg_state = checkpoint.get("cfg_te_state")
+            if isinstance(cfg_state, dict):
+                self.inject_rt_context = bool(cfg_state.get("train_inject_rt_context", self.inject_rt_context))
+                self.rt_context_blend = float(cfg_state.get("train_rt_context_blend", self.rt_context_blend))
             print(f"[ProposedTCPlanner] 가중치 로드 완료: {self.weight_path}")
         else:
             print(f"[ProposedTCPlanner] 경고: 가중치 파일({self.weight_path})이 없어 랜덤 초기화 상태로 추론합니다.")
             
         self.transformer.eval()
         self.consistency.eval()
+
+    def _inject_runtime_history_context(self, history_A: np.ndarray, current_node: int, last_switch_t: int, t: int) -> np.ndarray:
+        """학습 시 `_augment_history_matrix`와 동일한 방식으로 추론 history 마지막 행에 RT context를 주입."""
+        aug = np.array(history_A, copy=True)
+        if not self.inject_rt_context:
+            return aug
+        if current_node < 0 or current_node >= aug.shape[1]:
+            return aug
+        ctx_row = np.zeros(aug.shape[1], dtype=np.float32)
+        ctx_row[current_node] = 1.0
+        L_hist = aug.shape[0]
+        tslw = float(min(t - last_switch_t, L_hist)) / float(max(L_hist, 1))
+        blend = float(self.rt_context_blend)
+        aug[-1] = (1.0 - blend) * aug[-1] + blend * ctx_row * (0.5 + 0.5 * tslw)
+        return aug
 
     def _build_condition(self, future_pred, utility_slice: np.ndarray, current_node: int, prev_node: int, N: int):
         """future_pred: (1, H, N_model) tensor; utility_slice: (H, N_env) array"""
@@ -166,6 +188,7 @@ class ProposedTCPlanner:
 
             prev_node = int(planned_idx[t - 1]) if t - 1 >= 0 else -1
             history_A = env_result.A_final[t - self.L : t, :]
+            history_A = self._inject_runtime_history_context(history_A, current_node, last_switch_t, t)
             state_tensor = torch.tensor(history_A, dtype=torch.float32).unsqueeze(0).to(self.device)
             H_eff = self.H
             t_end = min(t + H_eff, T)

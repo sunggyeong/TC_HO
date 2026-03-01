@@ -10,7 +10,7 @@ Includes:
   - TC (offline / realtime corrected)
 """
 from __future__ import annotations
-import argparse, os, time
+import argparse, json, os, time
 from pathlib import Path
 from typing import Any, Dict, List
 import numpy as np
@@ -64,6 +64,48 @@ def load_models(weights: str, exp_cfg: ExperimentConfig, outdir: Path):
     # L, H를 cfg_te에도 반영해야 plan builder들이 올바른 H로 condition 벡터를 만든다
     cfg_te.L = L
     cfg_te.H = H
+    # 1) 새 버전 weight: cfg_te_state 내 runtime 설정 우선 복원
+    # 2) 구버전 weight: sibling train_manifest_*.json에서 fallback 복원
+    cfg_state = ckpt.get("cfg_te_state")
+    if isinstance(cfg_state, dict):
+        for k, v in cfg_state.items():
+            if hasattr(cfg_te, k):
+                setattr(cfg_te, k, v)
+    else:
+        weight_dir = Path(weights).resolve().parent
+        for manifest_path in sorted(weight_dir.glob("train_manifest_*.json")):
+            try:
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                restore_keys = [
+                    "rt_enable_pending",
+                    "rt_enable_mbb",
+                    "rt_pending_freeze_horizon",
+                    "rt_pending_advance_margin",
+                    "rt_mbb_lookahead",
+                    "rt_enable_guardrails",
+                    "rt_min_dwell",
+                    "rt_hysteresis_ratio",
+                    "rt_hysteresis_abs",
+                    "rt_pingpong_window",
+                    "rt_pingpong_extra_hysteresis_ratio",
+                    "rt_switch_time_offset_max",
+                ]
+                for k in restore_keys:
+                    if k in manifest and hasattr(cfg_te, k):
+                        setattr(cfg_te, k, manifest[k])
+                rt_guardrails = manifest.get("rt_guardrails")
+                if isinstance(rt_guardrails, dict):
+                    if "dwell" in rt_guardrails:
+                        cfg_te.rt_min_dwell = int(rt_guardrails["dwell"])
+                    if "hysteresis" in rt_guardrails:
+                        cfg_te.rt_hysteresis_ratio = float(rt_guardrails["hysteresis"])
+                    if "pingpong_window" in rt_guardrails:
+                        cfg_te.rt_pingpong_window = int(rt_guardrails["pingpong_window"])
+                    if "pingpong_extra" in rt_guardrails:
+                        cfg_te.rt_pingpong_extra_hysteresis_ratio = float(rt_guardrails["pingpong_extra"])
+                break
+            except (json.JSONDecodeError, OSError):
+                pass
     transformer = tc.OnlineTransformerPredictor(num_nodes=N, L=L, H=H).to(device)
     consistency = tc.OnlineConsistencyGenerator(num_nodes=N, H=H).to(device)
     transformer.load_state_dict(ckpt["transformer_state_dict"])
@@ -109,9 +151,8 @@ def main():
     if bundle:
         cfg_te, transformer, consistency = bundle
         print(f"[OK] loaded weights: {args.weights}")
-        # Make sure RT uses lookahead fallback by default
         cfg_te.rt_fallback_mode = "lookahead"
-        cfg_te.rt_enable_pending = True
+        # rt_enable_pending / rt_enable_mbb / rt_pending_* 는 load_models에서 manifest로 복원됨
         cfg_te.rt_debug_log = bool(args.rt_debug)
     else:
         cfg_te = transformer = consistency = None

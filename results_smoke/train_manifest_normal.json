@@ -1,0 +1,60 @@
+{
+  "scenario": "normal",
+  "preset": "balanced",
+  "epochs": 1,
+  "max_sats": 50,
+  "train_seeds": [
+    0
+  ],
+  "val_seeds": [
+    1
+  ],
+  "test_seeds": [
+    2
+  ],
+  "L": 20,
+  "H": 30,
+  "stride": 10,
+  "lr": 0.001,
+  "reward_learnable": false,
+  "alpha_oracle_loss": 0.3,
+  "beta_pred_action_loss": 1.0,
+  "rollout_steps": 2,
+  "rollout_loss_weight": 0.35,
+  "reward_time_offset_penalty": 0.0,
+  "val_score_weights": {
+    "w_avail": 0.5,
+    "w_latency": 0.18,
+    "w_interrupt": 0.12,
+    "w_jitter": 0.08,
+    "w_pp": 0.25,
+    "w_hof": 0.25,
+    "w_ho": 0.05,
+    "w_rt_accept": 0.05,
+    "w_rt_fallback": 0.03,
+    "w_rt_block": 0.02
+  },
+  "lambda_bc": 0.02,
+  "rt_fallback_alpha_latency": 0.05,
+  "train_use_history_augmentation": true,
+  "train_aug_flip_prob": 0.02,
+  "train_aug_dropout_prob": 0.06,
+  "train_aug_phase_extra": 0.1,
+  "penalties": {
+    "w_switch": 0.18,
+    "w_pingpong": 0.6,
+    "w_jitter": 0.35
+  },
+  "rt_guardrails": {
+    "dwell": 3,
+    "hysteresis": 0.1,
+    "pingpong_window": 5,
+    "pingpong_extra": 0.15
+  },
+  "rt_enable_pending": true,
+  "rt_enable_mbb": true,
+  "rt_mbb_lookahead": 1,
+  "rt_pending_freeze_horizon": 1,
+  "rt_pending_advance_margin": 1,
+  "elapsed_sec": 162.29908061027527
+}
