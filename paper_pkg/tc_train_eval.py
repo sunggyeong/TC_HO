@@ -93,8 +93,8 @@ class TrainEvalRealtimeConfig:
     reward_learnable: bool = False
     alpha_oracle_loss: float = 0.3
     beta_pred_action_loss: float = 1.0
-    rollout_steps: int = 1
-    rollout_loss_weight: float = 0.2
+    rollout_steps: int = 2          # 1 → 2: RT semantics 정렬 강화
+    rollout_loss_weight: float = 0.35  # 0.2 → 0.35
     train_use_history_augmentation: bool = True
     train_aug_flip_prob: float = 0.02
     train_aug_dropout_prob: float = 0.06
@@ -152,6 +152,30 @@ class TrainEvalRealtimeConfig:
     val_w_pp: float = 0.25
     val_w_hof: float = 0.25
     val_w_ho: float = 0.05        # ho_pen = ho_count / 300
+    # RT 실행성 힌트 (acceptance bonus, fallback/block penalty)
+    # surrogate가 잘 맞아도 RT가 제안을 안 쓰면 best가 아님을 반영
+    val_w_rt_accept: float = 0.05   # RT acceptance rate bonus
+    val_w_rt_fallback: float = 0.03 # RT fallback rate penalty
+    val_w_rt_block: float = 0.02    # guardrail block rate penalty
+
+    # ---- Oracle guardrail fusion ----
+    # min_dwell/hysteresis가 tc_train_eval에서는 rt_ 접두사로 이미 존재, 별도 필드 불필요
+    # (rt_min_dwell, rt_hysteresis_ratio 기존 필드 재사용)
+
+    # ---- Pending commitment (freeze horizon + advance margin) ----
+    rt_pending_freeze_horizon: int = 1   # 실행까지 이 슬롯 이하이면 예약 교체 금지
+    rt_pending_advance_margin: int = 1   # 새 exec_t + margin < 기존 exec_t 일 때만 교체
+
+    # ---- reliability floor (oracle/BC teacher 최소 강도) ----
+    train_rel_oracle_floor: float = 0.35  # FP 많은 노드도 이 이하로는 안 약화 (accept 급락 방어)
+
+    # ---- best checkpoint soft gate ----
+    val_accept_gate: float = 0.08              # accept 이 미만 에포크에 soft penalty
+    val_accept_underflow_penalty: float = 1.0  # penalty 강도 (score -= penalty * (gate - accept))
+
+    # ---- RT context injection ----
+    train_inject_rt_context: bool = True    # Transformer 입력에 current_node + tslw 블렌딩
+    train_rt_context_blend: float = 0.3     # 마지막 history 행에 블렌딩 강도 (0=끄기)
 
     # ---- BC (imitation) loss ----
     # oracle (best_i, best_n) teacher — 반응형 잔재 없이 예측형 정책 유도용 정규화
@@ -437,11 +461,17 @@ def _find_best_reward_guided_target(
 ) -> Tuple[int, int, float]:
     """
     미래 H-step 후보 (time_offset, node)를 스캔해서 통합보상(mini) 기준 최적 후보를 선택.
+    RT 가드레일(min_dwell, hysteresis) 조건을 미달하는 스위치는 hard 페널티로 탈락시킴.
     유효 후보가 없으면 (0,0, invalid_penalty) 반환.
     """
     H, N = future_A_true.shape
     best_i, best_n = 0, 0
     best_r = -1e18
+
+    # RT 가드레일 파라미터
+    min_dwell       = int(getattr(cfg_te, 'rt_min_dwell', 1))
+    hyst_ratio      = float(getattr(cfg_te, 'rt_hysteresis_ratio', 0.05))
+    guardrail_hard  = -1000.0  # 가드레일 통과 불가 시 강제 페널티
 
     any_valid = False
     for i in range(H):
@@ -458,6 +488,22 @@ def _find_best_reward_guided_target(
                 current_node=current_node,
                 cfg_te=cfg_te,
             )
+
+            # ---- RT 가드레일 융합 ----
+            if int(n) != current_node:
+                curr_avail_at_i = (0 <= current_node < N and future_A_true[i, current_node] == 1)
+                if curr_avail_at_i:
+                    # 1. Min dwell: 스위치 후 min_dwell 슬롯 동안 n이 가용해야 함
+                    dwell_end = min(i + min_dwell, H)
+                    if not np.all(future_A_true[i:dwell_end, int(n)] == 1):
+                        r = guardrail_hard
+                    # 2. Hysteresis: 새 노드가 현재 노드보다 hysteresis_ratio 이상 좋아야 함
+                    elif hyst_ratio > 0 and future_A_true[i, current_node] == 1:
+                        curr_u = float(future_U_true[i, current_node])
+                        new_u  = float(future_U_true[i, int(n)])
+                        if new_u < curr_u * (1.0 + hyst_ratio):
+                            r = guardrail_hard
+
             eps = float(getattr(cfg_te, "reward_tie_breaker_epsilon", 1e-6))
             if r > best_r or (abs(r - best_r) < eps and i < best_i):
                 best_r = float(r)
@@ -580,25 +626,48 @@ def _reward_for_action(
     )
 
 
-def _augment_history_matrix(history_A: np.ndarray, actual_env, t: int, cfg_te: TrainEvalRealtimeConfig) -> np.ndarray:
+def _augment_history_matrix(
+    history_A: np.ndarray,
+    actual_env,
+    t: int,
+    cfg_te: TrainEvalRealtimeConfig,
+    current_node: int = -1,
+    last_switch_t: int = 0,
+) -> np.ndarray:
     aug = np.array(history_A, copy=True)
     if not getattr(cfg_te, "train_use_history_augmentation", True):
-        return aug
-    flip_prob = float(getattr(cfg_te, "train_aug_flip_prob", 0.02))
-    drop_prob = float(getattr(cfg_te, "train_aug_dropout_prob", 0.05))
-    extra = float(getattr(cfg_te, "train_aug_phase_extra", 0.05))
-    ph = getattr(actual_env, "phase", None)
-    if ph is not None and t > 0:
-        window = ph[max(0, t - len(history_A)):t]
-        if len(window) >= 2 and np.any(window[1:] != window[:-1]):
-            flip_prob += extra
-            drop_prob += extra
-    if drop_prob > 0:
-        mask = (np.random.rand(*aug.shape) < drop_prob)
-        aug[mask] = 0.0
-    if flip_prob > 0:
-        mask = (np.random.rand(*aug.shape) < flip_prob)
-        aug[mask] = 1.0 - aug[mask]
+        # RT 컨텍스트는 augmentation 플래그와 독립적으로 주입 가능
+        pass
+    else:
+        flip_prob = float(getattr(cfg_te, "train_aug_flip_prob", 0.02))
+        drop_prob = float(getattr(cfg_te, "train_aug_dropout_prob", 0.05))
+        extra = float(getattr(cfg_te, "train_aug_phase_extra", 0.05))
+        ph = getattr(actual_env, "phase", None)
+        if ph is not None and t > 0:
+            window = ph[max(0, t - len(history_A)):t]
+            if len(window) >= 2 and np.any(window[1:] != window[:-1]):
+                flip_prob += extra
+                drop_prob += extra
+        if drop_prob > 0:
+            mask = (np.random.rand(*aug.shape) < drop_prob)
+            aug[mask] = 0.0
+        if flip_prob > 0:
+            mask = (np.random.rand(*aug.shape) < flip_prob)
+            aug[mask] = 1.0 - aug[mask]
+
+    # RT 컨텍스트 주입: 모델 입력(L×N)의 마지막 행에 current_node one-hot을 블렌딩
+    # 구조 변경 없이 Transformer가 "현재 연결 노드"와 "스위치 경과 시간"을 암묵적으로 학습
+    if getattr(cfg_te, 'train_inject_rt_context', True) and current_node >= 0 and current_node < aug.shape[1]:
+        L_hist = aug.shape[0]
+        ctx_blend = float(getattr(cfg_te, 'train_rt_context_blend', 0.3))
+        # current_node one-hot (어느 노드에 연결 중인지)
+        ctx_row = np.zeros(aug.shape[1], dtype=np.float32)
+        ctx_row[current_node] = 1.0
+        # time_since_last_switch 정규화 → 0(방금 스위치)~1(오래됨): 마지막 행 전체를 스케일
+        tslw = float(min(t - last_switch_t, L_hist)) / float(max(L_hist, 1))
+        # 마지막 행에만 RT 컨텍스트 블렌딩 (가용성 이력을 크게 왜곡하지 않도록)
+        aug[-1] = (1.0 - ctx_blend) * aug[-1] + ctx_blend * ctx_row * (0.5 + 0.5 * tslw)
+
     return aug
 
 
@@ -880,14 +949,40 @@ def train_on_seed_pool(
             if N2 != N:
                 raise ValueError(f'num_nodes mismatch in training: expected {N}, got {N2}')
 
+            # G3: EMA reliability — RT planner와 동일한 공식으로 초기화
+            _alpha_rel    = float(getattr(cfg_te, 'rt_reliability_alpha', 0.9))
+            _fp_extra_pen = float(getattr(cfg_te, 'rt_fp_extra_penalty', 0.85))
+            ema_reliability = np.ones(N, dtype=np.float32)
+            # G2: last_switch_t 추적 (RT 컨텍스트 주입에 사용)
+            _last_switch_t = 0
+            _prev_node_for_sw = -1
+
             for t in range(L, T - H, cfg_te.stride):
+                current_node_approx = _best_available_node(A_target[t - 1], U_target[t - 1]) if t - 1 >= 0 else -1
+                prev_node_approx    = _best_available_node(A_target[t - 2], U_target[t - 2]) if t - 2 >= 0 else -1
+                # last_switch_t 갱신: 이전 슬롯에서 노드가 바뀌었으면 기록
+                if current_node_approx != _prev_node_for_sw and _prev_node_for_sw != -1:
+                    _last_switch_t = t - 1
+                _prev_node_for_sw = current_node_approx
+
+                # G3: EMA reliability 업데이트 — RT planner의 reliability 계산과 100% 동기
+                _match = (A_in[t].astype(np.int32) == A_target[t].astype(np.int32)).astype(np.float32)
+                ema_reliability = _alpha_rel * ema_reliability + (1.0 - _alpha_rel) * _match
+                _fp_mask = (A_in[t] == 1) & (A_target[t] == 0)
+                ema_reliability[_fp_mask] *= _fp_extra_pen
+                ema_reliability = np.clip(ema_reliability, 0.05, 1.0)
+                node_reliability_proxy = ema_reliability  # 이제 EMA 기반
+
+                # G2: RT 컨텍스트(current_node, time_since_last_switch)를 state에 주입
                 history_A = A_in[t-L:t, :]
-                history_A = _augment_history_matrix(history_A, actual_env, t, cfg_te)
+                history_A = _augment_history_matrix(
+                    history_A, actual_env, t, cfg_te,
+                    current_node=current_node_approx,
+                    last_switch_t=_last_switch_t,
+                )
                 future_A_true = A_target[t:t+H, :]
                 state_tensor = torch.tensor(history_A, dtype=torch.float32, device=device).unsqueeze(0)
                 future_tensor_true = torch.tensor(future_A_true, dtype=torch.float32, device=device).unsqueeze(0)
-                current_node_approx = _best_available_node(A_target[t - 1], U_target[t - 1]) if t - 1 >= 0 else -1
-                prev_node_approx = _best_available_node(A_target[t - 2], U_target[t - 2]) if t - 2 >= 0 else -1
 
                 optimizer.zero_grad()
                 future_pred = transformer(state_tensor)
@@ -922,10 +1017,15 @@ def train_on_seed_pool(
                     rl_weight_torch = _reward_to_supervision_weight(reward_val, cfg_te)
 
                 epoch_reward += float(reward_val)
-                # Oracle loss: CrossEntropy on discrete heads (replaces MSE on continuous ratio)
                 best_i_t = torch.tensor([best_i], dtype=torch.long, device=device)
                 best_n_t = torch.tensor([best_n], dtype=torch.long, device=device)
-                loss_oracle = rl_weight_torch * (
+
+                # reliability-aware oracle loss (floor 적용): FP 발생률 높은 노드의 teacher를 약화하되
+                # floor 이하로는 내려가지 않음 → "gap 감소 + accept 급락" 패턴 방지
+                _rel_raw   = float(node_reliability_proxy[best_n]) if 0 <= best_n < N else 1.0
+                _rel_floor = float(getattr(cfg_te, 'train_rel_oracle_floor', 0.35))
+                rel_oracle_scale = max(_rel_floor, _rel_raw)
+                loss_oracle = rl_weight_torch * rel_oracle_scale * (
                     F.cross_entropy(offset_logits, best_i_t) +
                     F.cross_entropy(node_logits, best_n_t)
                 )
@@ -933,16 +1033,11 @@ def train_on_seed_pool(
                 loss_rollout = _mini_rollout_penalty(transformer, online_consistency, A_in, A_target, U_target, t, current_node_approx, prev_node_approx, cfg_te, device, L_target=L_target)
                 loss_rl = float(getattr(cfg_te, 'alpha_oracle_loss', 0.6)) * loss_oracle + float(getattr(cfg_te, 'beta_pred_action_loss', 0.4)) * loss_pred + float(getattr(cfg_te, 'rollout_loss_weight', 0.35)) * loss_rollout
 
-                # BC (imitation) loss: teacher = greedy best available node at slot t, offset = 0
-                avail_t_bc = np.where(A_target[t] == 1)[0]
-                if len(avail_t_bc) > 0:
-                    teacher_n_bc = int(avail_t_bc[np.argmax(U_target[t, avail_t_bc])])
-                    loss_bc = (
-                        F.cross_entropy(offset_logits, torch.zeros(1, dtype=torch.long, device=device)) +
-                        F.cross_entropy(node_logits, torch.tensor([teacher_n_bc], dtype=torch.long, device=device))
-                    )
-                else:
-                    loss_bc = offset_logits.sum() * 0.0
+                # BC loss: oracle target (best_i, best_n), rel_oracle_scale floor 동일 적용
+                loss_bc = rel_oracle_scale * (
+                    F.cross_entropy(offset_logits, best_i_t) +
+                    F.cross_entropy(node_logits, best_n_t)
+                )
 
                 # discrete argmax for pred reward tracking
                 pred_i = int(offset_logits[0].argmax().item())
@@ -960,6 +1055,9 @@ def train_on_seed_pool(
                 update_ema_target(online_consistency, target_consistency)
                 epoch_loss += float(total_loss.item()); epoch_loss_tf += float(loss_tf.item()); epoch_loss_rl += float(loss_rl.item()); epoch_loss_cs += float(loss_cs.item()); step_count += 1
 
+        avg_oracle = epoch_reward / max(1, step_count)
+        avg_pred   = epoch_pred_reward / max(1, step_count)
+        reward_gap = avg_oracle - avg_pred   # 낮을수록 surrogate ↔ RT 간극이 작음
         row = {
             'epoch': epoch + 1,
             'steps': step_count,
@@ -967,11 +1065,18 @@ def train_on_seed_pool(
             'avg_tf_loss': epoch_loss_tf / max(1, step_count),
             'avg_rl_loss': epoch_loss_rl / max(1, step_count),
             'avg_cs_loss': epoch_loss_cs / max(1, step_count),
-            'avg_reward': epoch_reward / max(1, step_count),
-            'avg_pred_reward': epoch_pred_reward / max(1, step_count),
+            'avg_reward': avg_oracle,
+            'avg_pred_reward': avg_pred,
+            'reward_gap': reward_gap,     # oracle - pred: 작을수록 surrogate와 RT 정렬 良
             'elapsed_sec': time.time() - t0,
         }
-        print(f"[train] epoch {epoch+1:02d}/{cfg_te.epochs} | loss={row['avg_total_loss']:.4f} (tf={row['avg_tf_loss']:.4f}, rl={row['avg_rl_loss']:.4f}, cs={row['avg_cs_loss']:.4f}) | oracle_reward={row['avg_reward']:.4f} | pred_reward={row['avg_pred_reward']:.4f} | elapsed={row['elapsed_sec']:.1f}s")
+        print(
+            f"[train] epoch {epoch+1:02d}/{cfg_te.epochs} | "
+            f"loss={row['avg_total_loss']:.4f} "
+            f"(tf={row['avg_tf_loss']:.4f}, rl={row['avg_rl_loss']:.4f}, cs={row['avg_cs_loss']:.4f}) | "
+            f"oracle={avg_oracle:.4f} pred={avg_pred:.4f} gap={reward_gap:+.4f} | "
+            f"elapsed={row['elapsed_sec']:.1f}s"
+        )
 
         if val_pairs:
             transformer.eval(); online_consistency.eval()
@@ -998,6 +1103,26 @@ def train_on_seed_pool(
                 jit_term = float(np.clip(1.0 - val_jitter   / 1000.0, 0.0, 1.0))
                 int_term = float(np.clip(1.0 - val_interrupt / 1000.0, 0.0, 1.0))
                 ho_pen   = val_ho / 300.0
+                # RT 실행성 지표 (val_score에 반영하기 위해 dbg보다 먼저 수집)
+                if len(df_dbg) > 0:
+                    rt_accept  = float(df_dbg["rt_acceptance_rate"].mean())
+                    rt_fallback= float(df_dbg["rt_fallback_rate"].mean())
+                    rt_block   = float(df_dbg["rt_guardrail_block_rate"].mean())
+                    row["val_rt_acceptance_rate"]    = rt_accept
+                    row["val_rt_fallback_rate"]      = rt_fallback
+                    row["val_rt_guardrail_block_rate"]= rt_block
+                    row["val_rt_model_proposed"]     = float(df_dbg["rt_model_proposed"].mean())
+                    row["val_rt_model_applied"]      = float(df_dbg["rt_model_applied"].mean())
+                    row["val_rt_fallback_used"]      = float(df_dbg["rt_fallback_used"].mean())
+                    row["val_rt_guardrail_block"]    = float(df_dbg["rt_guardrail_block"].mean())
+                    row["val_rt_make_before_break"]  = float(df_dbg['rt_make_before_break'].mean()) if 'rt_make_before_break' in df_dbg.columns else float('nan')
+                else:
+                    rt_accept = rt_fallback = rt_block = float('nan')
+                    for k in ["val_rt_acceptance_rate","val_rt_fallback_rate","val_rt_guardrail_block_rate",
+                              "val_rt_model_proposed","val_rt_model_applied","val_rt_fallback_used",
+                              "val_rt_guardrail_block","val_rt_make_before_break"]:
+                        row[k] = float('nan')
+
                 val_score = (
                     cfg_te.val_w_avail     * val_avail
                     + cfg_te.val_w_latency   * lat_term
@@ -1006,6 +1131,10 @@ def train_on_seed_pool(
                     - cfg_te.val_w_pp        * val_pp
                     - cfg_te.val_w_hof       * val_hof
                     - cfg_te.val_w_ho        * ho_pen
+                    # RT 실행성 힌트: acceptance 많을수록 보너스, fallback/block 많을수록 페널티
+                    + (cfg_te.val_w_rt_accept   * rt_accept   if not math.isnan(rt_accept)   else 0.0)
+                    - (cfg_te.val_w_rt_fallback  * rt_fallback if not math.isnan(rt_fallback) else 0.0)
+                    - (cfg_te.val_w_rt_block     * rt_block    if not math.isnan(rt_block)    else 0.0)
                 )
                 row['val_score']     = val_score
                 row['val_avail']     = val_avail
@@ -1016,28 +1145,12 @@ def train_on_seed_pool(
                 row['val_ho']        = val_ho
                 row['val_pp']        = val_pp
                 row['val_hof']       = val_hof
-                if len(df_dbg) > 0:
-                    row["val_rt_acceptance_rate"] = float(df_dbg["rt_acceptance_rate"].mean())
-                    row["val_rt_fallback_rate"] = float(df_dbg["rt_fallback_rate"].mean())
-                    row["val_rt_guardrail_block_rate"] = float(df_dbg["rt_guardrail_block_rate"].mean())
-                    row["val_rt_model_proposed"] = float(df_dbg["rt_model_proposed"].mean())
-                    row["val_rt_model_applied"] = float(df_dbg["rt_model_applied"].mean())
-                    row["val_rt_fallback_used"] = float(df_dbg["rt_fallback_used"].mean())
-                    row["val_rt_guardrail_block"] = float(df_dbg["rt_guardrail_block"].mean())
-                    row["val_rt_make_before_break"] = float(df_dbg['rt_make_before_break'].mean()) if 'rt_make_before_break' in df_dbg.columns else float('nan')
-                else:
-                    row["val_rt_acceptance_rate"] = float("nan")
-                    row["val_rt_fallback_rate"] = float("nan")
-                    row["val_rt_guardrail_block_rate"] = float("nan")
-                    row["val_rt_model_proposed"] = float("nan")
-                    row["val_rt_model_applied"] = float("nan")
-                    row["val_rt_fallback_used"] = float("nan")
-                    row["val_rt_guardrail_block"] = float('nan')
-                    row['val_rt_make_before_break'] = float('nan')
 
+                # surrogate ↔ RT 정렬 진단: gap이 줄고 val_score가 오르면 진짜 개선
+                train_gap = row.get('reward_gap', float('nan'))
                 print(
                     f"[val] epoch {epoch+1:02d}/{cfg_te.epochs} | "
-                    f"score={val_score:.4f} | "
+                    f"score={val_score:.4f} | gap={train_gap:+.4f} | "
                     f"Avail={val_avail:.4f} | QoE={val_qoe:.4f}(log) | "
                     f"Lat={val_latency:.1f}ms | Int={val_interrupt:.1f}ms | Jit={val_jitter:.1f}ms | "
                     f"PP={val_pp:.4f} | HOF={val_hof:.4f} | HO={val_ho:.0f} | "
@@ -1046,8 +1159,17 @@ def train_on_seed_pool(
                     f"block={row['val_rt_guardrail_block_rate']:.3f}",
                     flush=True,
                 )
-                if val_score > best_val_score:
-                    best_val_score = val_score
+                # best 저장: accept 급락 에포크에 soft penalty 적용 (hard gate 없이)
+                _rt_accept_now = row.get("val_rt_acceptance_rate", float("nan"))
+                _accept_gate   = float(getattr(cfg_te, "val_accept_gate", 0.08))
+                _accept_pen    = float(getattr(cfg_te, "val_accept_underflow_penalty", 1.0))
+                save_metric = float(val_score)
+                if not math.isnan(_rt_accept_now):
+                    save_metric -= _accept_pen * max(0.0, _accept_gate - _rt_accept_now)
+                row["val_save_metric"] = save_metric
+
+                if save_metric > best_val_score:
+                    best_val_score = save_metric
                     save_weights(transformer, online_consistency, cfg_te.weight_path, reward_weights_module)
                     print(f"[best] saved best checkpoint: {cfg_te.weight_path}")
             transformer.train(); online_consistency.train()
@@ -1338,12 +1460,34 @@ def build_learned_realtime_corrected_plan(
             )
             target_node_idx = min(max(target_node_idx, 0), N - 1)
 
-            # ---- (A-2) Pending Scheduler / 즉시 제안 결정 ----
+            # ---- (A-2) Pending Scheduler (freeze horizon + advance margin) ----
             if cfg_te.rt_enable_pending:
                 new_exec_t = t + target_time_offset
-                # 재예측마다 pending 갱신: 더 이른(또는 동일) 도착 예정이면 교체
-                if _pending_exec_t == -1 or new_exec_t <= _pending_exec_t:
-                    _pending_node = int(target_node_idx)
+                new_n = int(target_node_idx)
+                _freeze_h  = int(getattr(cfg_te, 'rt_pending_freeze_horizon', 1))
+                _adv_margin= int(getattr(cfg_te, 'rt_pending_advance_margin', 1))
+
+                pending_node_lost = (
+                    _pending_exec_t != -1
+                    and 0 <= _pending_node < N
+                    and A_actual[t, _pending_node] == 0
+                )
+                pending_due_soon  = (
+                    _pending_exec_t != -1
+                    and (_pending_exec_t - t) <= _freeze_h
+                )
+
+                replace_ok = False
+                if _pending_exec_t == -1 or pending_node_lost:
+                    # 예약 없음 or 예약 노드 소실 → 무조건 새 예약
+                    replace_ok = True
+                elif not pending_due_soon:
+                    # 곧 실행될 예약이 아닌 경우 → 확실히 더 빠를 때만 교체
+                    if new_exec_t + _adv_margin < _pending_exec_t:
+                        replace_ok = True
+
+                if replace_ok:
+                    _pending_node = new_n
                     _pending_exec_t = new_exec_t
                     dbg_pending_set += 1
 

@@ -88,7 +88,8 @@ class OnlineConsistencyGenerator(nn.Module):
 class ProposedTCPlanner:
     def __init__(self, L=20, H=30, device='cpu', weight_path='trained_weights_rl.pth',
                  switch_time_offset_max=1, min_dwell=3, hysteresis_ratio=0.08,
-                 enable_pending=True):
+                 enable_pending=True,
+                 pending_freeze_horizon: int = 1, pending_advance_margin: int = 1):
         self.L = L
         self.H = H
         self.device = device
@@ -97,6 +98,8 @@ class ProposedTCPlanner:
         self.min_dwell = min_dwell
         self.hysteresis_ratio = hysteresis_ratio
         self.enable_pending = enable_pending
+        self.pending_freeze_horizon = pending_freeze_horizon
+        self.pending_advance_margin = pending_advance_margin
         self.num_nodes = None
         self.transformer = None
         self.consistency = None
@@ -188,12 +191,32 @@ class ProposedTCPlanner:
                 target_time_offset = min(max(target_time_offset, 0), self.H - 1)
                 target_node_idx = min(max(target_node_idx, 0), N - 1)
 
-            # ---- Pending Scheduler ----
+            # ---- Pending Scheduler (freeze horizon + advance margin) ----
             if self.enable_pending:
                 new_exec_t = t + target_time_offset
-                # 재예측마다 갱신: 더 이른(또는 동일) 예약이면 교체
-                if _pending_exec_t == -1 or new_exec_t <= _pending_exec_t:
-                    _pending_node = int(target_node_idx)
+                new_n = int(target_node_idx)
+
+                pending_node_lost = (
+                    _pending_exec_t != -1
+                    and 0 <= _pending_node < N
+                    and env_result.A_final[t, _pending_node] == 0
+                )
+                pending_due_soon = (
+                    _pending_exec_t != -1
+                    and (_pending_exec_t - t) <= self.pending_freeze_horizon
+                )
+
+                replace_ok = False
+                if _pending_exec_t == -1 or pending_node_lost:
+                    # 예약 없음 or 예약 노드 소실 → 무조건 새 예약
+                    replace_ok = True
+                elif not pending_due_soon:
+                    # 곧 실행 예정이 아닌 경우 → 확실히 더 빠를 때만 교체
+                    if new_exec_t + self.pending_advance_margin < _pending_exec_t:
+                        replace_ok = True
+
+                if replace_ok:
+                    _pending_node = new_n
                     _pending_exec_t = new_exec_t
 
                 # 예약 슬롯 도래 시 실행 시도

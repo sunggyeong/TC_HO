@@ -39,8 +39,8 @@ def main():
                     help="oracle point-regression loss weight (default 0.3)")
     ap.add_argument("--beta_pred_action_loss",   type=float, default=1.0,
                     help="expected-reward / soft-action loss weight (default 1.0)")
-    ap.add_argument("--rollout_steps",              type=int,   default=1)
-    ap.add_argument("--rollout_loss_weight",        type=float, default=0.0)
+    ap.add_argument("--rollout_steps",              type=int,   default=2)
+    ap.add_argument("--rollout_loss_weight",        type=float, default=0.35)
     ap.add_argument("--reward_time_offset_penalty", type=float, default=None,
                     help="offset 패널티 강도 (default: cfg 기본값 0.02). 올리면 모델이 낮은 offset 선호")
     ap.add_argument("--val_w_avail",     type=float, default=None, help="val_score: availability weight (default 0.50)")
@@ -49,7 +49,10 @@ def main():
     ap.add_argument("--val_w_jitter",    type=float, default=None, help="val_score: jitter term weight (default 0.08)")
     ap.add_argument("--val_w_pp",        type=float, default=None, help="val_score: pingpong penalty weight (default 0.25)")
     ap.add_argument("--val_w_hof",       type=float, default=None, help="val_score: HO failure penalty weight (default 0.25)")
-    ap.add_argument("--val_w_ho",        type=float, default=None, help="val_score: HO attempt penalty weight (default 0.05)")
+    ap.add_argument("--val_w_ho",         type=float, default=None, help="val_score: HO attempt penalty weight (default 0.05)")
+    ap.add_argument("--val_w_rt_accept",  type=float, default=None, help="val_score: RT acceptance rate bonus (default 0.05)")
+    ap.add_argument("--val_w_rt_fallback",type=float, default=None, help="val_score: RT fallback rate penalty (default 0.03)")
+    ap.add_argument("--val_w_rt_block",   type=float, default=None, help="val_score: guardrail block rate penalty (default 0.02)")
     ap.add_argument("--lambda_bc", type=float, default=None,
                     help="behavior cloning auxiliary loss weight")
     ap.add_argument("--rt_fallback_alpha_latency", type=float, default=None,
@@ -70,6 +73,10 @@ def main():
                     help="disable Make-Before-Break early execution")
     ap.add_argument("--rt_mbb_lookahead", type=int, default=None,
                     help="MBB lookahead slots (default: cfg 기본값 1)")
+    ap.add_argument("--rt_pending_freeze_horizon", type=int,   default=None,
+                    help="실행까지 이 슬롯 이하이면 pending 교체 금지 (default 1)")
+    ap.add_argument("--rt_pending_advance_margin", type=int,   default=None,
+                    help="새 exec_t + margin < 기존 exec_t 일 때만 pending 교체 허용 (default 1)")
 
     # --- history augmentation ---
     ap.add_argument("--disable_history_augmentation", action="store_true")
@@ -110,13 +117,16 @@ def main():
     if args.reward_time_offset_penalty is not None:
         cfg_te.reward_time_offset_penalty = float(args.reward_time_offset_penalty)
     # val score weights — CLI로 지정 시 cfg 기본값 위에 덮어씀
-    if args.val_w_avail     is not None: cfg_te.val_w_avail     = float(args.val_w_avail)
-    if args.val_w_latency   is not None: cfg_te.val_w_latency   = float(args.val_w_latency)
-    if args.val_w_interrupt is not None: cfg_te.val_w_interrupt = float(args.val_w_interrupt)
-    if args.val_w_jitter    is not None: cfg_te.val_w_jitter    = float(args.val_w_jitter)
-    if args.val_w_pp        is not None: cfg_te.val_w_pp        = float(args.val_w_pp)
-    if args.val_w_hof       is not None: cfg_te.val_w_hof       = float(args.val_w_hof)
-    if args.val_w_ho        is not None: cfg_te.val_w_ho        = float(args.val_w_ho)
+    if args.val_w_avail       is not None: cfg_te.val_w_avail       = float(args.val_w_avail)
+    if args.val_w_latency     is not None: cfg_te.val_w_latency     = float(args.val_w_latency)
+    if args.val_w_interrupt   is not None: cfg_te.val_w_interrupt   = float(args.val_w_interrupt)
+    if args.val_w_jitter      is not None: cfg_te.val_w_jitter      = float(args.val_w_jitter)
+    if args.val_w_pp          is not None: cfg_te.val_w_pp          = float(args.val_w_pp)
+    if args.val_w_hof         is not None: cfg_te.val_w_hof         = float(args.val_w_hof)
+    if args.val_w_ho          is not None: cfg_te.val_w_ho          = float(args.val_w_ho)
+    if getattr(args, 'val_w_rt_accept',  None) is not None: cfg_te.val_w_rt_accept  = float(args.val_w_rt_accept)
+    if getattr(args, 'val_w_rt_fallback',None) is not None: cfg_te.val_w_rt_fallback= float(args.val_w_rt_fallback)
+    if getattr(args, 'val_w_rt_block',   None) is not None: cfg_te.val_w_rt_block   = float(args.val_w_rt_block)
     if args.lambda_bc is not None:
         cfg_te.lambda_bc = float(args.lambda_bc)
     if args.rt_fallback_alpha_latency is not None:
@@ -146,6 +156,10 @@ def main():
     cfg_te.rt_enable_mbb = not bool(args.disable_mbb)
     if args.rt_mbb_lookahead is not None:
         cfg_te.rt_mbb_lookahead = int(args.rt_mbb_lookahead)
+    if getattr(args, 'rt_pending_freeze_horizon',  None) is not None:
+        cfg_te.rt_pending_freeze_horizon  = int(args.rt_pending_freeze_horizon)
+    if getattr(args, 'rt_pending_advance_margin',  None) is not None:
+        cfg_te.rt_pending_advance_margin  = int(args.rt_pending_advance_margin)
     cfg_te.rt_fallback_mode = "lookahead"
     cfg_te.rt_debug_log = False
 
@@ -179,14 +193,19 @@ def main():
         "reward_time_offset_penalty": cfg_te.reward_time_offset_penalty,
         # val_score_weights: 실제 적용된 가중치 전체 기록 (CLI/코드 어느 쪽에서 바꿔도 반영됨)
         "val_score_weights": {
-            "w_avail":     cfg_te.val_w_avail,
-            "w_latency":   cfg_te.val_w_latency,
-            "w_interrupt": getattr(cfg_te, "val_w_interrupt", 0.12),
-            "w_jitter":    cfg_te.val_w_jitter,
-            "w_pp":        cfg_te.val_w_pp,
-            "w_hof":       cfg_te.val_w_hof,
-            "w_ho":        cfg_te.val_w_ho,
+            "w_avail":       cfg_te.val_w_avail,
+            "w_latency":     cfg_te.val_w_latency,
+            "w_interrupt":   getattr(cfg_te, "val_w_interrupt", 0.12),
+            "w_jitter":      cfg_te.val_w_jitter,
+            "w_pp":          cfg_te.val_w_pp,
+            "w_hof":         cfg_te.val_w_hof,
+            "w_ho":          cfg_te.val_w_ho,
+            "w_rt_accept":   getattr(cfg_te, "val_w_rt_accept",   0.05),
+            "w_rt_fallback": getattr(cfg_te, "val_w_rt_fallback", 0.03),
+            "w_rt_block":    getattr(cfg_te, "val_w_rt_block",    0.02),
         },
+        "rollout_steps":        cfg_te.rollout_steps,
+        "rollout_loss_weight":  cfg_te.rollout_loss_weight,
         "lambda_bc": cfg_te.lambda_bc,
         "rt_fallback_alpha_latency": cfg_te.rt_fallback_alpha_latency,
         "train_use_history_augmentation": cfg_te.train_use_history_augmentation,
@@ -199,6 +218,8 @@ def main():
         "rt_enable_pending": cfg_te.rt_enable_pending,
         "rt_enable_mbb": cfg_te.rt_enable_mbb,
         "rt_mbb_lookahead": cfg_te.rt_mbb_lookahead,
+        "rt_pending_freeze_horizon":  getattr(cfg_te, 'rt_pending_freeze_horizon',  1),
+        "rt_pending_advance_margin":  getattr(cfg_te, 'rt_pending_advance_margin',  1),
         "elapsed_sec": time.time() - t0,
     }
     (outdir / f"train_manifest_{args.scenario}.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
