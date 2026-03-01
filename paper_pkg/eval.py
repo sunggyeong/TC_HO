@@ -152,11 +152,21 @@ def main():
         cfg_te, transformer, consistency = bundle
         print(f"[OK] loaded weights: {args.weights}")
         cfg_te.rt_fallback_mode = "lookahead"
-        # rt_enable_pending / rt_enable_mbb / rt_pending_* 는 load_models에서 manifest로 복원됨
         cfg_te.rt_debug_log = bool(args.rt_debug)
     else:
         cfg_te = transformer = consistency = None
-        print("ℹ️ baselines only (no TC weights)")
+        print("[INFO] baselines only (no TC weights)")
+
+    # RT wrapper config: TC weights 없어도 RTWrapped baselines에 사용할 기본 cfg
+    # TC weights 있으면 동일 cfg_te 재사용, 없으면 preset 가드레일 반영 기본 cfg 생성
+    if cfg_te is not None:
+        wrap_cfg = cfg_te
+    else:
+        wrap_cfg = tc.TrainEvalRealtimeConfig()
+        wrap_cfg.rt_min_dwell                    = int(preset["rt_dwell"])
+        wrap_cfg.rt_hysteresis_ratio             = float(preset["rt_hysteresis"])
+        wrap_cfg.rt_pingpong_window              = int(preset["rt_pingpong_window"])
+        wrap_cfg.rt_pingpong_extra_hysteresis_ratio = float(preset["rt_pingpong_extra"])
 
     rows: List[Dict[str, Any]] = []
     phase_rows: List[Dict[str, Any]] = []
@@ -200,15 +210,30 @@ def main():
         tl, m = execute_plan_on_env(actual, plan, "Reactive_MyopicGreedy", "reactive", 0, exp_cfg)
         m["seed"]=seed; m["Scenario"]=args.scenario; rows.append(m)
 
-        plan = plan_lookahead_greedy(A_pred, U_pred, L_pred, look=look, guard=guard)
-        tl, m = execute_plan_on_env(actual, plan, "Lookahead_Greedy", "reactive", 0, exp_cfg)
+        look_plan_base = plan_lookahead_greedy(A_pred, U_pred, L_pred, look=look, guard=guard)
+        tl, m = execute_plan_on_env(actual, look_plan_base, "Lookahead_Greedy", "reactive", 0, exp_cfg)
         m["seed"]=seed; m["Scenario"]=args.scenario; rows.append(m)
 
-        plan = plan_shooting_search_delta_node(A_pred, U_pred, L_pred, search=shoot, guard=guard, seed=seed)
-        tl, m = execute_plan_on_env(actual, plan, "ShootingSearch_DeltaNode", "reactive", 0, exp_cfg)
+        shoot_plan_base = plan_shooting_search_delta_node(A_pred, U_pred, L_pred, search=shoot, guard=guard, seed=seed)
+        tl, m = execute_plan_on_env(actual, shoot_plan_base, "ShootingSearch_DeltaNode", "reactive", 0, exp_cfg)
         m["seed"]=seed; m["Scenario"]=args.scenario; rows.append(m)
 
-        # TC
+        # ---- RTWrapped baselines (same RT correction layer, planning-only proposal) ----
+        # DAG plan은 이미 baselines 블록에서 계산됨 — 여기서 재계산 방지용 캐시
+        dag_plan_pred = sustainable_dag_plan(pred, exp_cfg)
+        rt_dag = tc.build_plan_rt_wrapped(actual, pred, dag_plan_pred, wrap_cfg)
+        tl, m = execute_plan_on_env(actual, rt_dag, "Predicted_DAG_RTWrapped", "sustainable_dag", 0, exp_cfg)
+        m["seed"]=seed; m["Scenario"]=args.scenario; rows.append(m)
+
+        rt_look = tc.build_plan_rt_wrapped(actual, pred, look_plan_base, wrap_cfg)
+        tl, m = execute_plan_on_env(actual, rt_look, "Lookahead_RTWrapped", "reactive", 0, exp_cfg)
+        m["seed"]=seed; m["Scenario"]=args.scenario; rows.append(m)
+
+        rt_shoot = tc.build_plan_rt_wrapped(actual, pred, shoot_plan_base, wrap_cfg)
+        tl, m = execute_plan_on_env(actual, rt_shoot, "ShootingSearch_RTWrapped", "reactive", 0, exp_cfg)
+        m["seed"]=seed; m["Scenario"]=args.scenario; rows.append(m)
+
+        # ---- TC ----
         if cfg_te is not None:
             offline = tc.build_learned_offline_plan_from_pred_env(pred, transformer, consistency, cfg_te, cfg_te.consistency_steps_eval)
             tl, m = execute_plan_on_env(actual, offline, "Learned_TC_Offline", "consistency", cfg_te.consistency_steps_eval, exp_cfg)

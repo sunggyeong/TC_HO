@@ -1805,6 +1805,219 @@ def build_learned_realtime_corrected_plan(
     return planned_idx
 
 
+def build_plan_rt_wrapped(
+    actual_env,
+    pred_env,
+    fixed_plan: np.ndarray,
+    cfg_te: "TrainEvalRealtimeConfig",
+    return_debug: bool = False,
+) -> "np.ndarray | Tuple[np.ndarray, Dict[str, Any]]":
+    """
+    기존 고정 계획(fixed_plan)에 Learned_TC_RTCorrected와 동일한 RT 보정 레이어를 적용.
+    - pending / MBB / guardrails / reliability EMA / actual-slot fallback 동일
+    - 모델 추론 없음: fixed_plan[t] 가 "제안 노드", time_offset = 0
+    → DAG/Lookahead/Shooting 등 planning-only 결과물에 wrapper를 씌워 공정 비교 가능
+    """
+    A_actual = np.asarray(actual_env.A_final)
+    U_actual = np.asarray(actual_env.utility)
+    A_pred   = np.asarray(pred_env.A_final)
+    _L_actual_raw = getattr(actual_env, 'latency_ms', None)
+    L_actual = np.asarray(_L_actual_raw) if _L_actual_raw is not None else None
+    _alpha_lat = float(cfg_te.rt_fallback_alpha_latency)
+
+    T, N = A_actual.shape
+    L    = cfg_te.L
+
+    planned_idx  = np.full(T, -1, dtype=int)
+    current_node = -1
+    last_switch_t = -10**9
+    A_obs_corrected = A_pred.copy()
+    reliability = np.ones(N, dtype=np.float32)
+    _pending_node: int  = -1
+    _pending_exec_t: int = -1
+
+    dbg_total_slots = T
+    dbg_model_proposed = 0; dbg_model_applied = 0
+    dbg_fallback_used = 0;  dbg_guardrail_block = 0
+    dbg_pending_set = 0;    dbg_pending_executed = 0
+    dbg_pending_early_fallback = 0; dbg_make_before_break = 0
+    dbg_model_decisions = 0; dbg_switch_intended = 0
+
+    def _score(t_: int, n_: int) -> float:
+        if n_ < 0 or n_ >= N or A_actual[t_, n_] != 1:
+            return -1e9
+        base = float(U_actual[t_, n_] * reliability[n_])
+        if L_actual is not None and t_ < L_actual.shape[0] and n_ < L_actual.shape[1]:
+            return base - _alpha_lat * float(L_actual[t_, n_]) / 50.0
+        return base
+
+    def _best_node(t_: int, avail_idx: np.ndarray) -> int:
+        if len(avail_idx) == 0:
+            return -1
+        scores = np.array([_score(t_, int(n)) for n in avail_idx], dtype=np.float32)
+        return int(avail_idx[np.argmax(scores)])
+
+    for t in range(T):
+        A_obs_corrected[t] = A_actual[t]
+        prev1 = int(planned_idx[t - 1]) if t - 1 >= 0 else -1
+        prev2 = int(planned_idx[t - 2]) if t - 2 >= 0 else -1
+        current_valid_now = (current_node >= 0 and current_node < N and A_actual[t, current_node] == 1)
+        model_based_switch = False
+
+        if t < L:
+            avail = np.where(A_actual[t] == 1)[0]
+            proposed = _best_node(t, avail) if len(avail) > 0 else -1
+            corrected = proposed
+        else:
+            dbg_model_decisions += 1
+            # fixed plan → target_node, offset = 0 (immediate proposal)
+            target_node_idx = int(fixed_plan[t]) if (0 <= int(fixed_plan[t]) < N) else current_node
+            target_time_offset = 0
+
+            _freeze_h   = int(getattr(cfg_te, 'rt_pending_freeze_horizon', 1))
+            _adv_margin = int(getattr(cfg_te, 'rt_pending_advance_margin', 1))
+            new_exec_t = t + target_time_offset
+            new_n = target_node_idx
+
+            pending_node_lost = (
+                _pending_exec_t != -1
+                and 0 <= _pending_node < N
+                and A_actual[t, _pending_node] == 0
+            )
+            pending_due_soon = (
+                _pending_exec_t != -1
+                and (_pending_exec_t - t) <= _freeze_h
+            )
+            replace_ok = False
+            if _pending_exec_t == -1 or pending_node_lost:
+                replace_ok = True
+            elif not pending_due_soon and new_exec_t + _adv_margin < _pending_exec_t:
+                replace_ok = True
+            if replace_ok:
+                _pending_node = new_n
+                _pending_exec_t = new_exec_t
+                dbg_pending_set += 1
+
+            # MBB
+            mbb_k = int(getattr(cfg_te, 'rt_mbb_lookahead', 1))
+            if (getattr(cfg_te, 'rt_enable_mbb', True)
+                    and current_valid_now
+                    and _pending_exec_t != -1
+                    and t + 1 < T
+                    and 0 <= _pending_node < N
+                    and A_actual[t, _pending_node] == 1):
+                future_end = min(t + 1 + mbb_k, T)
+                if np.any(A_obs_corrected[t + 1 : future_end, current_node] == 0):
+                    _pending_node_save = int(_pending_node)
+                    _pending_node = -1; _pending_exec_t = -1
+                    proposed = _pending_node_save
+                    dbg_model_proposed += 1; dbg_make_before_break += 1
+                else:
+                    proposed = current_node
+            else:
+                proposed = current_node
+
+            # pending execution
+            if proposed == current_node and _pending_exec_t != -1 and t >= _pending_exec_t:
+                pn = int(_pending_node)
+                _pending_node = -1; _pending_exec_t = -1
+                if 0 <= pn < N and A_actual[t, pn] == 1:
+                    proposed = pn; dbg_model_proposed += 1; dbg_pending_executed += 1
+                else:
+                    avail_now = np.where(A_actual[t] == 1)[0]
+                    if len(avail_now) > 0:
+                        best = _best_node(t, avail_now)
+                        if best != current_node:
+                            proposed = best; dbg_model_proposed += 1; dbg_pending_executed += 1
+
+            if proposed is not None and proposed >= 0 and proposed < N and proposed != current_node:
+                dbg_switch_intended += 1
+
+            proposed_valid = (proposed is not None and 0 <= proposed < N and A_actual[t, proposed] == 1)
+            low_rel = (proposed is not None and 0 <= proposed < N and float(reliability[proposed]) < cfg_te.rt_low_reliability_threshold)
+
+            corrected = current_node
+            if proposed_valid:
+                corrected = proposed; model_based_switch = True
+            else:
+                # pending early execution on link failure
+                if (cfg_te.rt_enable_pending and _pending_exec_t != -1
+                        and current_node != -1 and A_actual[t, current_node] == 0
+                        and 0 <= _pending_node < N and A_actual[t, _pending_node] == 1):
+                    corrected = int(_pending_node); model_based_switch = True
+                    _pending_node = -1; _pending_exec_t = -1; dbg_pending_early_fallback += 1
+                elif cfg_te.rt_use_actual_current_slot_fallback:
+                    avail = np.where(A_actual[t] == 1)[0]
+                    if len(avail) > 0:
+                        fallback = _best_node(t, avail)
+                        corrected = current_node if (current_valid_now and low_rel) else fallback
+                        if corrected != current_node: dbg_fallback_used += 1
+                    else:
+                        corrected = -1 if not current_valid_now else current_node
+                else:
+                    corrected = current_node if current_valid_now else -1
+
+        # guardrails
+        if cfg_te.rt_enable_guardrails:
+            corrected_valid = (corrected is not None and 0 <= corrected < N and A_actual[t, corrected] == 1)
+            if corrected_valid and current_valid_now and corrected != current_node:
+                blocked = False
+                if (t - last_switch_t) < int(cfg_te.rt_min_dwell):
+                    corrected = current_node; blocked = True
+                else:
+                    s_cur = _score(t, current_node); s_new = _score(t, corrected)
+                    req = float(cfg_te.rt_hysteresis_ratio)
+                    is_pp = (corrected == prev2 and prev2 != -1 and prev1 == current_node
+                             and (t - last_switch_t) <= int(cfg_te.rt_pingpong_window))
+                    if is_pp: req += float(cfg_te.rt_pingpong_extra_hysteresis_ratio)
+                    ok = (s_new >= s_cur * (1.0 + req))
+                    if float(cfg_te.rt_hysteresis_abs) > 0.0:
+                        ok = ok and ((s_new - s_cur) >= float(cfg_te.rt_hysteresis_abs))
+                    if not ok: corrected = current_node; blocked = True
+                if blocked: dbg_guardrail_block += 1
+            if corrected == -1 and current_valid_now:
+                corrected = current_node
+
+        if corrected != -1 and (corrected < 0 or corrected >= N or A_actual[t, corrected] != 1):
+            corrected = -1
+        if corrected != current_node and corrected != -1:
+            last_switch_t = t
+        if t >= L and model_based_switch and corrected == proposed and corrected != current_node:
+            dbg_model_applied += 1
+
+        current_node = int(corrected) if corrected is not None else -1
+        planned_idx[t] = current_node
+
+        # reliability EMA
+        match = (A_pred[t].astype(np.int32) == A_actual[t].astype(np.int32)).astype(np.float32)
+        reliability = cfg_te.rt_reliability_alpha * reliability + (1.0 - cfg_te.rt_reliability_alpha) * match
+        fp_mask = (A_pred[t] == 1) & (A_actual[t] == 0)
+        reliability[fp_mask] *= cfg_te.rt_fp_extra_penalty
+        reliability = np.clip(reliability, 0.05, 1.0)
+
+    debug_stats: Dict[str, Any] = {
+        "rt_total_slots": int(dbg_total_slots),
+        "rt_model_decisions": int(dbg_model_decisions),
+        "rt_switch_intended": int(dbg_switch_intended),
+        "rt_model_proposed": int(dbg_model_proposed),
+        "rt_model_applied": int(dbg_model_applied),
+        "rt_fallback_used": int(dbg_fallback_used),
+        "rt_guardrail_block": int(dbg_guardrail_block),
+        "rt_pending_set": int(dbg_pending_set),
+        "rt_pending_executed": int(dbg_pending_executed),
+        "rt_pending_early_fallback": int(dbg_pending_early_fallback),
+        "rt_make_before_break": int(dbg_make_before_break),
+    }
+    den = max(1, int(dbg_model_proposed))
+    debug_stats["rt_acceptance_rate"]    = float(dbg_model_applied) / float(den)
+    debug_stats["rt_fallback_rate"]      = float(dbg_fallback_used) / float(den)
+    debug_stats["rt_guardrail_block_rate"] = float(dbg_guardrail_block) / float(den)
+
+    if return_debug:
+        return planned_idx, debug_stats
+    return planned_idx
+
+
 # =========================================================
 # Evaluation on hold-out seeds
 # =========================================================
